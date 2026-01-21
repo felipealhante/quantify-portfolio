@@ -1,0 +1,35 @@
+import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="Quantify Portfolio", layout="centered")
+
+st.title("Portfolio Visualizer")
+
+tickers_input = st.text_input("Tickers (comma separated)", "AAPL,MSFT,NVDA")
+values_input = st.text_input("Dollar values (comma separated)", "40000,30000,30000")
+
+try:
+    tickers = [t.strip().upper().replace("ˆ", "^") for t in tickers_input.split(",") if t.strip()]
+    values = np.array([float(v) for v in values_input.split(",") if v.strip()], dtype=float)
+
+    if len(tickers) != len(values):
+        st.error("Tickers and values must match (same amount of items).")
+        st.stop()
+
+    total = float(values.sum())
+    if total <= 0:
+        st.error("Total portfolio value must be > 0.")
+        st.stop()
+
+    weights = values / total
+
+    st.subheader("Holdings")
+    for t, v, w in zip(tickers, values, weights):
+        st.write(f"**{t}** — ${v:,.2f}  |  {w*100:.2f}%")
+
+    st.write(f"**Total portfolio value:** ${total:,.2f}")
+
+    # Pie chart (weights)
+    fig1, ax1 = plt.subplots()
+    ax1.pie(weights, lab
