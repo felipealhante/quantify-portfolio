@@ -1,161 +1,327 @@
+# portfolio_app.py
+import datetime as dt
 
 import numpy as np
 import pandas as pd
-import datetime as dt
 import yfinance as yf
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Monte Carlo Simulator", layout="wide")
+st.set_page_config(page_title="Portfolio Visualizer", layout="wide")
 
-# ---------- Title (same vibe as your screenshot)
 st.markdown(
-    "<h1 style='text-align:center; font-size:64px; margin-bottom:10px;'>Monte Carlo Simulator</h1>",
+    "<h1 style='text-align:center; font-size:58px; margin-bottom:6px;'>Portfolio Visualizer</h1>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<p style='text-align:center; opacity:0.75; margin-top:0;'>Build, visualize, and analyze a portfolio from Yahoo Finance data.</p>",
     unsafe_allow_html=True,
 )
 
-# ---------- Inputs (center column for the clean look)
+# ---------------- Helpers ----------------
+def normalize_tickers(raw: str) -> list[str]:
+    # Split by comma/space/newline, uppercase, remove empties
+    parts = []
+    for chunk in raw.replace("\n", ",").replace(" ", ",").split(","):
+        t = chunk.strip().upper()
+        if t:
+            parts.append(t)
+    # Unique but keep order
+    seen = set()
+    out = []
+    for t in parts:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
+def parse_weights(raw: str, n: int) -> np.ndarray | None:
+    """
+    raw example: "0.5,0.3,0.2"
+    returns normalized weights sum=1, or None if invalid/empty
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        vals = []
+        for x in raw.replace("\n", ",").replace(" ", ",").split(","):
+            x = x.strip()
+            if x:
+                vals.append(float(x))
+        if len(vals) != n:
+            return None
+        w = np.array(vals, dtype=float)
+        if np.any(w < 0):
+            return None
+        s = float(w.sum())
+        if s <= 0:
+            return None
+        return w / s
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def download_adj_close(tickers: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
+    df = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+    if df.empty:
+        return pd.DataFrame()
+    # When multiple tickers, yfinance returns columns like ('Close', 'AAPL') or 'Close' etc.
+    # With auto_adjust=True, we can use 'Close' as adjusted.
+    if isinstance(df.columns, pd.MultiIndex):
+        # Grab Close level
+        if "Close" in df.columns.get_level_values(0):
+            close = df["Close"].copy()
+        else:
+            # fallback: take last level if needed
+            close = df.xs(df.columns.levels[0][0], axis=1, level=0)
+    else:
+        # single ticker -> series-like columns
+        if "Close" in df.columns:
+            close = df[["Close"]].copy()
+            close.columns = tickers  # rename to ticker
+        else:
+            return pd.DataFrame()
+
+    # Ensure all requested tickers present
+    close = close.dropna(how="all")
+    close = close.fillna(method="ffill").dropna(how="any")
+    # If single ticker returned as Series, ensure DataFrame
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name=tickers[0])
+    return close
+
+
+def portfolio_metrics(port_ret: pd.Series, rf: float = 0.0) -> dict:
+    """
+    port_ret: daily returns series
+    rf: annual risk-free rate (e.g. 0.03)
+    """
+    if port_ret.empty:
+        return {}
+    ann_factor = 252
+    avg = port_ret.mean() * ann_factor
+    vol = port_ret.std(ddof=0) * np.sqrt(ann_factor)
+
+    # Sharpe using annual rf -> convert rf to daily approx
+    sharpe = np.nan
+    if vol > 0:
+        sharpe = (avg - rf) / vol
+
+    # Equity curve + drawdown
+    equity = (1 + port_ret).cumprod()
+    peak = equity.cummax()
+    dd = equity / peak - 1
+    max_dd = dd.min()
+
+    # CAGR
+    days = (port_ret.index[-1] - port_ret.index[0]).days
+    years = days / 365.25 if days > 0 else np.nan
+    cagr = np.nan
+    if years and years > 0:
+        cagr = equity.iloc[-1] ** (1 / years) - 1
+
+    return {
+        "CAGR": cagr,
+        "Annual Vol": vol,
+        "Sharpe": sharpe,
+        "Max Drawdown": max_dd,
+        "Annual Return": avg,
+    }
+
+
+# ---------------- Sidebar Inputs ----------------
 colL, colC, colR = st.columns([1, 2, 1])
+
 with colC:
-    ticker = st.text_input("One Ticker (Yahoo Finance)", "AAPL").strip().upper()
+    tickers_raw = st.text_area(
+        "Tickers (comma-separated)",
+        value="AAPL, MSFT, NVDA, SPY",
+        height=70,
+    )
+    tickers = normalize_tickers(tickers_raw)
 
     today = dt.date.today()
-    default_start = today - dt.timedelta(days=365 * 3)
+    start_default = today - dt.timedelta(days=365 * 3)
 
-    start_date = st.date_input("Start date", value=default_start)
-    end_date = st.date_input("End date", value=today)
+    c1, c2 = st.columns(2)
+    with c1:
+        start_date = st.date_input("Start date", value=start_default)
+    with c2:
+        end_date = st.date_input("End date", value=today)
 
     st.markdown("---")
 
-    num_simulations = st.slider("Number of simulations", 50, 2000, 300, step=50)
-    num_days = st.slider("Forecast horizon (trading days)", 30, 756, 252, step=21)
+    weights_raw = st.text_input(
+        "Weights (optional, must match tickers count; example: 0.4,0.3,0.3)",
+        value="",
+    )
 
-    seed = st.number_input("Random seed", value=42, step=1)
+    bmk = st.text_input("Benchmark ticker (optional)", value="SPY").strip().upper()
+    rf = st.number_input("Risk-free rate (annual, e.g. 0.03 = 3%)", value=0.03, step=0.01, format="%.2f")
 
-    run = st.button("Run simulation", type="primary", use_container_width=True)
+    run = st.button("Run", type="primary", use_container_width=True)
 
 if not run:
+    st.stop()
+
+if len(tickers) < 1:
+    st.error("Add at least one ticker.")
     st.stop()
 
 if start_date >= end_date:
     st.error("Start date must be before end date.")
     st.stop()
 
-@st.cache_data(show_spinner=False)
-def download_prices(ticker: str, start: dt.date, end: dt.date) -> pd.Series:
-    data = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
-    if data.empty or "Close" not in data.columns:
-        return pd.Series(dtype=float)
-    return data["Close"].dropna()
+weights = parse_weights(weights_raw, len(tickers))
 
-prices = download_prices(ticker, start_date, end_date)
+# ---------------- Download Data ----------------
+with st.spinner("Downloading prices..."):
+    prices = download_adj_close(tickers, start_date, end_date)
 
 if prices.empty:
-    st.error(f"No valid data for ticker '{ticker}'. Try another symbol or date range.")
+    st.error("No data returned. Check tickers/date range.")
     st.stop()
 
-if len(prices) < 10:
-    st.error("Not enough data points to run Monte Carlo (need at least ~10 closes).")
-    st.stop()
+# If some tickers got dropped due to missing data
+tickers_final = list(prices.columns)
+if tickers_final != tickers:
+    st.warning(f"Using tickers with full data: {', '.join(tickers_final)}")
+    tickers = tickers_final
+    weights = parse_weights(weights_raw, len(tickers))  # re-validate
 
-# ---------- Log returns (GBM-ish like your code)
-log_returns = np.log(prices / prices.shift(1)).dropna()
-mu = float(log_returns.mean())
-sigma = float(log_returns.std())
-last_price = float(prices.iloc[-1])
+# Default weights if none given
+if weights is None:
+    weights = np.ones(len(tickers)) / len(tickers)
 
-# ---------- Monte Carlo simulation
-rng = np.random.default_rng(int(seed))
-sim_paths = np.zeros((num_days + 1, int(num_simulations)), dtype=float)
-sim_paths[0, :] = last_price
+# ---------------- Returns & Portfolio ----------------
+rets = prices.pct_change().dropna()
+port_ret = (rets * weights).sum(axis=1)
+equity = (1 + port_ret).cumprod()
 
-for j in range(int(num_simulations)):
-    for t in range(1, num_days + 1):
-        z = rng.normal(0, 1)
-        sim_paths[t, j] = sim_paths[t - 1, j] * np.exp(mu + sigma * z)
+# Benchmark
+bmk_equity = None
+bmk_ret = None
+if bmk:
+    bmk_prices = download_adj_close([bmk], start_date, end_date)
+    if not bmk_prices.empty:
+        bmk_ret = bmk_prices.iloc[:, 0].pct_change().dropna()
+        # Align dates with portfolio
+        bmk_ret = bmk_ret.reindex(port_ret.index).dropna()
+        if len(bmk_ret) > 5:
+            bmk_equity = (1 + bmk_ret).cumprod()
 
-# ---------- Percentiles
-p5 = np.percentile(sim_paths, 5, axis=1)
-p50 = np.percentile(sim_paths, 50, axis=1)
-p95 = np.percentile(sim_paths, 95, axis=1)
+# ---------------- Metrics ----------------
+m = portfolio_metrics(port_ret, rf=rf)
+col1, col2, col3, col4, col5 = st.columns(5)
 
-# Build a DataFrame for plotting
-days = np.arange(0, num_days + 1)
-paths_df = pd.DataFrame(sim_paths, index=days)
-paths_long = paths_df.reset_index().melt(id_vars="index", var_name="path", value_name="price")
-paths_long = paths_long.rename(columns={"index": "day"})
+col1.metric("Tickers", f"{len(tickers)}")
+col2.metric("CAGR", f"{m['CAGR']*100:,.2f}%" if pd.notna(m["CAGR"]) else "—")
+col3.metric("Annual Vol", f"{m['Annual Vol']*100:,.2f}%" if pd.notna(m["Annual Vol"]) else "—")
+col4.metric("Sharpe", f"{m['Sharpe']:.2f}" if pd.notna(m["Sharpe"]) else "—")
+col5.metric("Max Drawdown", f"{m['Max Drawdown']*100:,.2f}%" if pd.notna(m["Max Drawdown"]) else "—")
 
-bands = pd.DataFrame({"day": days, "p5": p5, "p50": p50, "p95": p95})
-final_prices = sim_paths[-1, :]
+st.markdown("<h2 style='font-size:34px; margin-top:22px;'>Performance</h2>", unsafe_allow_html=True)
 
-# ---------- Summary
-up_10 = last_price * 1.10
-down_10 = last_price * 0.90
+# ---------------- Performance chart ----------------
+perf_df = pd.DataFrame({"Portfolio": equity})
+if bmk_equity is not None:
+    # align equities
+    bmk_equity = bmk_equity.reindex(equity.index).dropna()
+    perf_df = perf_df.loc[bmk_equity.index]
+    perf_df[bmk] = bmk_equity
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Last price", f"{last_price:,.2f}")
-col2.metric("Median final", f"{np.median(final_prices):,.2f}")
-col3.metric("P(final > +10%)", f"{(final_prices > up_10).mean():.2%}")
-col4.metric("P(final < -10%)", f"{(final_prices < down_10).mean():.2%}")
-
-st.markdown(
-    "<h2 style='font-size:38px; margin-top:30px;'>Monte Carlo Paths</h2>",
-    unsafe_allow_html=True,
-)
-
-# ---------- Plot paths (sample a bit so it stays fast + readable)
-max_to_plot = min(200, int(num_simulations))  # show at most 200 paths
-paths_long_plot = paths_long[paths_long["path"].astype(int) < max_to_plot]
-
-fig_paths = px.line(
-    paths_long_plot,
-    x="day",
-    y="price",
-    color="path",
+fig_perf = px.line(
+    perf_df.reset_index().rename(columns={"index": "date"}).melt(id_vars="date", var_name="Series", value_name="Value"),
+    x="date",
+    y="Value",
+    color="Series",
     template="plotly_white",
 )
+fig_perf.update_layout(height=460, margin=dict(l=20, r=20, t=10, b=40), legend_title_text="")
+fig_perf.update_xaxes(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+fig_perf.update_yaxes(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+st.plotly_chart(fig_perf, use_container_width=True)
 
-# hide legend for the 200 paths (too messy), keep clean grid
-fig_paths.update_layout(
-    height=520,
-    showlegend=False,
-    margin=dict(l=20, r=20, t=10, b=40),
-    xaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-    yaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-)
+# ---------------- Allocation + Correlation + Drawdown ----------------
+cA, cB = st.columns([1, 1])
 
-# Add percentile bands/lines
-fig_paths.add_scatter(x=bands["day"], y=bands["p50"], mode="lines", name="Median (50%)", line=dict(width=4))
-fig_paths.add_scatter(x=bands["day"], y=bands["p5"], mode="lines", name="5%", line=dict(width=3))
-fig_paths.add_scatter(x=bands["day"], y=bands["p95"], mode="lines", name="95%", line=dict(width=3))
+with cA:
+    st.markdown("<h2 style='font-size:34px; margin-top:10px;'>Allocation</h2>", unsafe_allow_html=True)
+    alloc_df = pd.DataFrame({"Ticker": tickers, "Weight": weights})
+    fig_alloc = px.pie(alloc_df, names="Ticker", values="Weight", hole=0.45, template="plotly_white")
+    fig_alloc.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), showlegend=True)
+    st.plotly_chart(fig_alloc, use_container_width=True)
 
-# Now show legend only for percentile lines
-fig_paths.update_layout(
-    legend=dict(
-        orientation="h",
-        yanchor="top",
-        y=-0.2,
-        xanchor="left",
-        x=0.0,
-        title=None
-    ),
-    showlegend=True,
-)
+with cB:
+    st.markdown("<h2 style='font-size:34px; margin-top:10px;'>Correlation</h2>", unsafe_allow_html=True)
+    corr = rets.corr()
+    fig_corr = px.imshow(
+        corr,
+        text_auto=True,
+        aspect="auto",
+        template="plotly_white",
+    )
+    fig_corr.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig_corr, use_container_width=True)
 
-st.plotly_chart(fig_paths, use_container_width=True)
+st.markdown("<h2 style='font-size:34px; margin-top:18px;'>Drawdown</h2>", unsafe_allow_html=True)
+dd = equity / equity.cummax() - 1
+dd_df = pd.DataFrame({"date": dd.index, "drawdown": dd.values})
 
-st.markdown(
-    "<h2 style='font-size:38px; margin-top:30px;'>Final Price Distribution</h2>",
-    unsafe_allow_html=True,
-)
+fig_dd = px.area(dd_df, x="date", y="drawdown", template="plotly_white")
+fig_dd.update_layout(height=340, margin=dict(l=20, r=20, t=10, b=40))
+fig_dd.update_xaxes(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+fig_dd.update_yaxes(title=None, tickformat=".0%", showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+st.plotly_chart(fig_dd, use_container_width=True)
 
-hist_df = pd.DataFrame({"final_price": final_prices})
-fig_hist = px.histogram(hist_df, x="final_price", nbins=30, template="plotly_white")
-fig_hist.update_layout(
-    height=420,
-    margin=dict(l=20, r=20, t=10, b=40),
-    xaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-    yaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-)
+# ---------------- Table: returns & stats ----------------
+st.markdown("<h2 style='font-size:34px; margin-top:18px;'>Assets</h2>", unsafe_allow_html=True)
 
-st.plotly_chart(fig_hist, use_container_width=True)
+asset_stats = []
+ann_factor = 252
+for t in tickers:
+    r = rets[t]
+    equity_t = (1 + r).cumprod()
+    peak_t = equity_t.cummax()
+    dd_t = (equity_t / peak_t - 1).min()
+    asset_stats.append(
+        {
+            "Ticker": t,
+            "Weight": float(weights[tickers.index(t)]),
+            "Ann Return": float(r.mean() * ann_factor),
+            "Ann Vol": float(r.std(ddof=0) * np.sqrt(ann_factor)),
+            "Max DD": float(dd_t),
+        }
+    )
+
+asset_df = pd.DataFrame(asset_stats)
+asset_df["Weight"] = asset_df["Weight"].map(lambda x: f"{x:.2%}")
+asset_df["Ann Return"] = asset_df["Ann Return"].map(lambda x: f"{x:.2%}")
+asset_df["Ann Vol"] = asset_df["Ann Vol"].map(lambda x: f"{x:.2%}")
+asset_df["Max DD"] = asset_df["Max DD"].map(lambda x: f"{x:.2%}")
+
+st.dataframe(asset_df, use_container_width=True)
+
+# ---------------- Download CSV ----------------
+st.markdown("---")
+out = pd.DataFrame({"Portfolio_Return": port_ret})
+out["Portfolio_Equity"] = equity
+if bmk_ret is not None:
+    out[f"{bmk}_Return"] = bmk_ret.reindex(out.index)
+    if bmk_equity is not None:
+        out[f"{bmk}_Equity"] = bmk_equity.reindex(out.index)
+
+csv = out.reset_index().rename(columns={"index": "date"}).to_csv(index=False).encode("utf-8")
+st.download_button("Download results CSV", data=csv, file_name="portfolio_results.csv", mime="text/csv")
