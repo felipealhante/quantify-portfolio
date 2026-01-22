@@ -62,4 +62,3 @@ plotly
 yfinance
 pandas
 numpy
-.streamlit/config.toml
