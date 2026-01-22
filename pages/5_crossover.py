@@ -1,4 +1,4 @@
-# pages/4_MA_Signal_Backtest.py
+# pages/5_crossover.py
 
 import datetime as dt
 import numpy as np
@@ -26,25 +26,49 @@ def download_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
         end=end,
         auto_adjust=False,
         progress=False,
+        group_by="column",   # keeps standard layout when possible
         threads=True,
     )
 
     if df is None or df.empty:
         raise ValueError(f"No data returned for ticker '{ticker}'. Try another symbol/date range.")
 
-    # Ensure we have Close
-    if "Close" not in df.columns:
-        raise ValueError(f"Ticker '{ticker}' returned no 'Close' column. Columns: {list(df.columns)}")
-
     df = df.copy()
     df.index = pd.to_datetime(df.index)
-    return df
+
+    # --- Handle MultiIndex columns (common on cloud)
+    if isinstance(df.columns, pd.MultiIndex):
+        # Prefer ("Close", ticker) if available
+        if ("Close", ticker) in df.columns:
+            close = df[("Close", ticker)]
+        elif ("Adj Close", ticker) in df.columns:
+            close = df[("Adj Close", ticker)]
+        else:
+            # Fallback: first "Close" column found
+            close_cols = [c for c in df.columns if c[0] in ("Close", "Adj Close")]
+            if not close_cols:
+                raise ValueError(f"Ticker '{ticker}' returned no Close/Adj Close columns.")
+            close = df[close_cols[0]]
+        out = pd.DataFrame({"Close": close})
+    else:
+        # Normal single-level columns
+        col = "Close" if "Close" in df.columns else ("Adj Close" if "Adj Close" in df.columns else None)
+        if col is None:
+            raise ValueError(f"Ticker '{ticker}' returned no Close/Adj Close columns. Columns: {list(df.columns)}")
+        out = df[[col]].rename(columns={col: "Close"})
+
+    # Force numeric + clean
+    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
+    out = out.dropna(subset=["Close"])
+    if out.empty:
+        raise ValueError("Close prices are empty after cleaning (all NaN).")
+
+    return out
 
 
 def build_signal(df: pd.DataFrame, buy_rule: str) -> pd.DataFrame:
     out = df.copy()
 
-    # buy_rule determines which crossover means +1
     if buy_rule == "Buy when MA60 > MA15":
         buy = out["MA60"] > out["MA15"]
         sell = out["MA60"] < out["MA15"]
@@ -56,16 +80,14 @@ def build_signal(df: pd.DataFrame, buy_rule: str) -> pd.DataFrame:
     out.loc[buy, "Signal"] = 1
     out.loc[sell, "Signal"] = -1
 
-    # Only allow signals after both MAs exist
     valid = out["MA15"].notna() & out["MA60"].notna()
     out.loc[~valid, "Signal"] = 0
     return out
 
 
 def add_buy_regime_vrects(fig: go.Figure, dates: pd.Series, signal: pd.Series):
-    """Shade +1 regimes as vertical rectangles."""
-    s = signal.fillna(0).astype(int).values
-    d = pd.to_datetime(dates).values
+    s = signal.fillna(0).astype(int).to_numpy()
+    d = pd.to_datetime(dates).to_numpy()
 
     in_regime = False
     start = None
@@ -134,43 +156,26 @@ if start_date >= end_date:
     st.error("Start date must be before end date.")
     st.stop()
 
-if ma_long <= ma_short:
-    st.warning("Usually long MA should be > short MA. (Not required, but results may be strange.)")
-
 
 # -----------------------------
-# Download + clean
+# Download + compute
 # -----------------------------
 try:
     with st.spinner("Downloading price data..."):
-        raw = download_prices(ticker, start_date, end_date)
+        df = download_prices(ticker, start_date, end_date)
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-df = raw[["Close"]].copy()
-
-# Force numeric Close (this fixes “blank chart” cases)
-df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-df = df.dropna(subset=["Close"])
-
-if df.empty:
-    st.error("After cleaning, Close prices are empty (all NaN). Try a different ticker/date range.")
-    st.stop()
-
-# Build MAs
 df["MA15"] = df["Close"].rolling(int(ma_short)).mean()
 df["MA60"] = df["Close"].rolling(int(ma_long)).mean()
 
-# Signal
 df = build_signal(df, buy_rule)
 
-# Backtest: next-day returns
 df["returns"] = df["Close"].pct_change().shift(-1)
 df["strategy_returns"] = df["Signal"] * df["returns"]
 df["cumulative_strategy_returns"] = (1 + df["strategy_returns"].fillna(0)).cumprod()
 
-# Reset index into a REAL Date column (Plotly reliability)
 df = df.reset_index().rename(columns={"index": "Date"})
 df["Date"] = pd.to_datetime(df["Date"])
 
@@ -180,7 +185,6 @@ df["Date"] = pd.to_datetime(df["Date"])
 # -----------------------------
 total_growth = float(df["cumulative_strategy_returns"].iloc[-1])
 total_return = (total_growth - 1) * 100
-
 pct_long = (df["Signal"] == 1).mean() * 100
 pct_short = (df["Signal"] == -1).mean() * 100
 
@@ -191,7 +195,7 @@ c3.metric("Time in +1 / -1", f"{pct_long:.1f}% / {pct_short:.1f}%")
 
 
 # -----------------------------
-# Chart 1: Price + MAs + Regime
+# Charts
 # -----------------------------
 st.subheader("Price + MAs + Regime")
 
@@ -208,16 +212,12 @@ fig1.update_layout(
     yaxis_title="Price",
     height=520,
     margin=dict(l=10, r=10, t=60, b=10),
-    template="plotly_dark",  # ensures visibility on dark theme
+    template="plotly_dark",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
 
 st.plotly_chart(fig1, use_container_width=True)
 
-
-# -----------------------------
-# Chart 2: Signal
-# -----------------------------
 st.subheader("Signal (+1 / -1)")
 fig2 = px.line(df, x="Date", y="Signal", title=f"{ticker} — Signal ({buy_rule})")
 fig2.update_traces(line_shape="hv")
@@ -225,16 +225,10 @@ fig2.update_layout(height=320, template="plotly_dark", margin=dict(l=10, r=10, t
 fig2.update_yaxes(range=[-1.1, 1.1])
 st.plotly_chart(fig2, use_container_width=True)
 
-
-# -----------------------------
-# Chart 3: Cumulative strategy
-# -----------------------------
 st.subheader("Cumulative Strategy Returns")
 fig3 = px.line(df, x="Date", y="cumulative_strategy_returns", title=f"{ticker} — Growth of $1")
 fig3.update_layout(height=360, template="plotly_dark", margin=dict(l=10, r=10, t=60, b=10))
 st.plotly_chart(fig3, use_container_width=True)
 
-
 with st.expander("Debug: show cleaned data"):
-    st.write("If charts are blank, check Close/Date values here:")
     st.dataframe(df[["Date", "Close", "MA15", "MA60", "Signal"]].tail(50), use_container_width=True)
