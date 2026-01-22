@@ -1,9 +1,3 @@
-# app.py — Streamlit Portfolio Allocation + Dollar Performance (Yahoo tickers)
-# Fixes common AAPL/NVDA issues by:
-# - robust ticker parsing
-# - robust yfinance multi/single ticker handling
-# - safe forward-fill + alignment
-
 import datetime as dt
 
 import numpy as np
@@ -11,19 +5,18 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Portfolio Visualizer", layout="wide")
-st.title("Portfolio Visualizer (Buy Price + Shares)")
-st.caption("Enter tickers, buy price, and shares. Shows allocation (current value) and portfolio performance in dollars.")
+st.set_page_config(page_title="Monte Carlo Portfolio Simulator", layout="wide")
+st.title("Monte Carlo Portfolio Simulator (Yahoo Finance)")
+st.caption("Simulate future portfolio values using historical daily log-returns (GBM-style simulation).")
 
 # ----------------------------
-# Helpers
+# Helpers (robust for AAPL/NVDA + multi-ticker)
 # ----------------------------
 def normalize_tickers(raw: str) -> list[str]:
     raw = raw.replace("\n", ",").replace(" ", ",")
     parts = [t.strip().upper().replace("ˆ", "^") for t in raw.split(",") if t.strip()]
-
-    # unique keep order
     seen, out = set(), []
     for t in parts:
         if t not in seen:
@@ -35,9 +28,9 @@ def normalize_tickers(raw: str) -> list[str]:
 @st.cache_data(show_spinner=False)
 def download_close(tickers: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
     """
-    Downloads adjusted close as 'Close' using auto_adjust=True.
-    Returns DataFrame columns=tickers.
-    Handles both single and multi-ticker yfinance output reliably.
+    auto_adjust=True -> adjusted close stored in 'Close'
+    Handles single vs multi ticker output reliably.
+    Returns DataFrame columns=tickers
     """
     if not tickers:
         return pd.DataFrame()
@@ -55,198 +48,270 @@ def download_close(tickers: list[str], start: dt.date, end: dt.date) -> pd.DataF
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Multi-ticker: MultiIndex columns like ('Close','AAPL')
+    # Multi ticker -> MultiIndex columns like ('Close','AAPL')
     if isinstance(df.columns, pd.MultiIndex):
         if "Close" not in df.columns.get_level_values(0):
             return pd.DataFrame()
         close = df["Close"].copy()
-        # Normalize column names
         close.columns = [str(c).upper() for c in close.columns]
     else:
-        # Single ticker: normal columns include 'Close'
+        # Single ticker -> normal columns include 'Close'
         if "Close" not in df.columns:
             return pd.DataFrame()
         close = df[["Close"]].copy()
         close.columns = [tickers[0].upper()]
 
-    # Clean and fill
     close.index = pd.to_datetime(close.index)
-    close = close.sort_index()
-    close = close.dropna(how="all").ffill()
-
+    close = close.sort_index().dropna(how="all").ffill()
     return close
 
 
-@st.cache_data(show_spinner=False)
-def get_latest_prices(tickers: list[str]) -> pd.Series:
+def ensure_positive_definite(cov: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     """
-    Gets last available adjusted close for each ticker from last ~15 days.
-    (More reliable than fast_info which can be blocked.)
+    Numerical stability for covariance (sometimes near-singular).
     """
-    end = dt.date.today()
-    start = end - dt.timedelta(days=15)
-    px_df = download_close(tickers, start, end)
-    if px_df.empty:
-        return pd.Series(dtype=float)
-    last = px_df.dropna().iloc[-1].astype(float)
-    last.index = last.index.astype(str).str.upper()
-    return last
+    cov = np.asarray(cov, dtype=float)
+    # Symmetrize
+    cov = 0.5 * (cov + cov.T)
+    # Add small jitter to diagonal
+    cov += np.eye(cov.shape[0]) * eps
+    return cov
 
 
-def money(x: float) -> str:
+def format_money(x: float) -> str:
     try:
         return f"${x:,.2f}"
     except Exception:
         return str(x)
 
-
 # ----------------------------
-# Inputs
+# UI
 # ----------------------------
-tickers_raw = st.text_area("Tickers (comma-separated)", value="AAPL, NVDA, MSFT", height=70)
+tickers_raw = st.text_area("Tickers (comma-separated)", value="AAPL, MSFT, NVDA", height=70)
 tickers = normalize_tickers(tickers_raw)
 
 today = dt.date.today()
-default_start = today - dt.timedelta(days=365 * 2)
+default_start = today - dt.timedelta(days=365 * 3)
 
 c1, c2 = st.columns(2)
 with c1:
-    start_date = st.date_input("Performance start date", value=default_start)
+    start_date = st.date_input("History start date", value=default_start)
 with c2:
-    end_date = st.date_input("Performance end date", value=today)
+    end_date = st.date_input("History end date", value=today)
 
-st.markdown("### Holdings")
-st.write("Enter **Buy Price** and **Shares** for each ticker. Shares default to 1 if empty/0.")
+st.markdown("### Portfolio holdings (optional)")
+st.write("If you enter shares, the simulation runs in **dollar values**. If you leave shares as 1 for all, it’s just equal-share portfolio.")
 
 if not tickers:
-    st.info("Please enter at least one ticker.")
+    st.info("Add at least one ticker.")
     st.stop()
 
-base_df = pd.DataFrame(
-    {
-        "Ticker": tickers,
-        "Buy Price": [np.nan] * len(tickers),
-        "Shares": [1.0] * len(tickers),
-    }
-)
-
-edited = st.data_editor(
-    base_df,
+hold_df = pd.DataFrame({"Ticker": tickers, "Shares": [1.0] * len(tickers)})
+holdings = st.data_editor(
+    hold_df,
     use_container_width=True,
     hide_index=True,
     column_config={
         "Ticker": st.column_config.TextColumn(disabled=True),
-        "Buy Price": st.column_config.NumberColumn(min_value=0.0, step=0.01),
         "Shares": st.column_config.NumberColumn(min_value=0.0, step=1.0),
     },
 )
 
-run = st.button("Run", type="primary", use_container_width=True)
+st.markdown("### Simulation settings")
+s1, s2, s3, s4 = st.columns(4)
+with s1:
+    n_sims = st.number_input("Simulations", min_value=100, max_value=50000, value=5000, step=100)
+with s2:
+    horizon_days = st.number_input("Horizon (trading days)", min_value=5, max_value=2000, value=252, step=5)
+with s3:
+    seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=42, step=1)
+with s4:
+    method = st.selectbox("Method", ["Multivariate (correlated)", "Independent"], index=0)
+
+rf_annual = st.number_input("Risk-free rate (annual, optional)", value=0.00, step=0.01, format="%.2f")
+
+run = st.button("Run Monte Carlo", type="primary", use_container_width=True)
 if not run:
     st.stop()
 
 # ----------------------------
-# Validate holdings inputs
+# Validate inputs
 # ----------------------------
-inputs = edited.copy()
-inputs["Ticker"] = inputs["Ticker"].astype(str).str.upper()
-
-inputs["Shares"] = pd.to_numeric(inputs["Shares"], errors="coerce").fillna(1.0)
-inputs.loc[inputs["Shares"] <= 0, "Shares"] = 1.0
-
-inputs["Buy Price"] = pd.to_numeric(inputs["Buy Price"], errors="coerce")
-if inputs["Buy Price"].isna().any():
-    st.error("Please fill **Buy Price** for all tickers.")
-    st.stop()
-
-# ----------------------------
-# Latest prices + allocation
-# ----------------------------
-with st.spinner("Fetching latest prices..."):
-    latest = get_latest_prices(inputs["Ticker"].tolist())
-
-missing = [t for t in inputs["Ticker"] if t not in latest.index]
-if missing:
-    st.warning(f"These tickers returned no recent price and were skipped: {', '.join(missing)}")
-
-inputs = inputs[inputs["Ticker"].isin(latest.index)].copy()
-if inputs.empty:
-    st.error("No usable tickers after price fetch. Check tickers.")
-    st.stop()
-
-inputs["Last Price"] = inputs["Ticker"].map(latest.to_dict()).astype(float)
-inputs["Cost Basis"] = inputs["Buy Price"] * inputs["Shares"]
-inputs["Current Value"] = inputs["Last Price"] * inputs["Shares"]
-inputs["P/L"] = inputs["Current Value"] - inputs["Cost Basis"]
-inputs["P/L %"] = np.where(inputs["Cost Basis"] > 0, inputs["P/L"] / inputs["Cost Basis"], np.nan)
-
-total_value = float(inputs["Current Value"].sum())
-inputs["Weight"] = inputs["Current Value"] / total_value
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Portfolio Value", money(total_value))
-m2.metric("Cost Basis", money(float(inputs["Cost Basis"].sum())))
-m3.metric("Total P/L", money(float(inputs["P/L"].sum())))
-m4.metric("Total Return", f"{(float(inputs['P/L'].sum()) / float(inputs['Cost Basis'].sum()))*100:.2f}%")
-
-st.markdown("### Allocation (by current market value)")
-fig_pie = px.pie(inputs, names="Ticker", values="Current Value", hole=0.45, template="plotly_white")
-fig_pie.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
-st.plotly_chart(fig_pie, use_container_width=True)
-
-st.markdown("### Holdings table")
-show_df = inputs[["Ticker", "Shares", "Buy Price", "Last Price", "Cost Basis", "Current Value", "P/L", "P/L %", "Weight"]].copy()
-show_df["P/L %"] = show_df["P/L %"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
-show_df["Weight"] = show_df["Weight"].map(lambda x: f"{x:.2%}")
-st.dataframe(show_df, use_container_width=True)
-
-# ----------------------------
-# Performance in dollars (not normalized)
-# ----------------------------
-st.markdown("### Portfolio performance (dollars)")
-
 if start_date >= end_date:
-    st.error("Start date must be before end date.")
+    st.error("History start date must be before end date.")
     st.stop()
 
+holdings = holdings.copy()
+holdings["Ticker"] = holdings["Ticker"].astype(str).str.upper()
+holdings["Shares"] = pd.to_numeric(holdings["Shares"], errors="coerce").fillna(1.0)
+holdings.loc[holdings["Shares"] <= 0, "Shares"] = 1.0
+
+# ----------------------------
+# Download history
+# ----------------------------
 with st.spinner("Downloading historical prices..."):
-    price_hist = download_close(inputs["Ticker"].tolist(), start_date, end_date)
+    prices = download_close(holdings["Ticker"].tolist(), start_date, end_date)
 
-price_hist = price_hist.dropna(axis=1, how="all").ffill()
-
-# align holdings to downloaded columns
-price_hist = price_hist.dropna(how="any")  # common dates across assets
-if price_hist.empty:
-    st.error("No historical data after aligning dates. Try a shorter date range or fewer tickers.")
+if prices.empty:
+    st.error("No data returned. Check tickers/date range.")
     st.stop()
 
-holdings = inputs.set_index("Ticker").reindex(price_hist.columns)
+# Drop tickers with no data
+prices = prices.dropna(axis=1, how="all").ffill()
+
+available = list(prices.columns)
+missing = [t for t in holdings["Ticker"] if t not in available]
+if missing:
+    st.warning(f"These tickers returned no data and were skipped: {', '.join(missing)}")
+
+prices = prices.dropna(how="any")  # align common dates
+if prices.shape[1] == 0 or len(prices) < 50:
+    st.error("Not enough usable data after alignment. Try more history or fewer tickers.")
+    st.stop()
+
+# align holdings with prices columns
+holdings = holdings.set_index("Ticker").reindex(prices.columns)
 shares = holdings["Shares"].astype(float).values
 
-# Dollar value through time
-port_value = (price_hist.values * shares).sum(axis=1)
-port_value = pd.Series(port_value, index=price_hist.index, name="Portfolio Value ($)")
+# Current portfolio value
+last_prices = prices.iloc[-1].values.astype(float)
+current_value = float(np.sum(last_prices * shares))
 
-perf_df = pd.DataFrame({"Date": port_value.index, "Portfolio Value ($)": port_value.values})
+# returns
+logrets = np.log(prices / prices.shift(1)).dropna()
+mu = logrets.mean().values.astype(float)          # daily mean log return per asset
+cov = logrets.cov().values.astype(float)          # daily covariance matrix
+cov = ensure_positive_definite(cov)
 
-fig_perf = px.line(perf_df, x="Date", y="Portfolio Value ($)", template="plotly_white")
-fig_perf.update_layout(height=420, margin=dict(l=20, r=20, t=10, b=40))
-fig_perf.update_xaxes(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)")
-fig_perf.update_yaxes(title="Portfolio Value ($)", showgrid=True, gridcolor="rgba(0,0,0,0.08)")
-st.plotly_chart(fig_perf, use_container_width=True)
+# Optionally add risk-free drift (very light-touch):
+# Convert annual rf to daily and add equally to drift (approx)
+rf_daily = (1.0 + float(rf_annual)) ** (1/252) - 1.0
+# we’ll keep mu as empirical; rf is just shown for reference / can be used later
 
-# Optional: drawdown
-dd = port_value / port_value.cummax() - 1
-dd_df = pd.DataFrame({"Date": dd.index, "Drawdown": dd.values})
-fig_dd = px.area(dd_df, x="Date", y="Drawdown", template="plotly_white")
-fig_dd.update_layout(height=260, margin=dict(l=20, r=20, t=10, b=40))
-fig_dd.update_xaxes(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)")
-fig_dd.update_yaxes(title="Drawdown", tickformat=".0%", showgrid=True, gridcolor="rgba(0,0,0,0.08)")
-st.plotly_chart(fig_dd, use_container_width=True)
+# ----------------------------
+# Monte Carlo simulation
+# ----------------------------
+np.random.seed(int(seed))
+n_assets = prices.shape[1]
+T = int(horizon_days)
+N = int(n_sims)
 
-# Debug info (helpful if tickers "fail")
+# Generate random shocks
+if method == "Multivariate (correlated)":
+    shocks = np.random.multivariate_normal(mean=np.zeros(n_assets), cov=cov, size=(N, T))
+else:
+    # independent using each asset variance
+    std = np.sqrt(np.diag(cov))
+    shocks = np.random.normal(loc=0.0, scale=std, size=(N, T, n_assets))
+
+# Build simulated log returns: r_t = mu + shock
+# Shapes:
+# correlated: shocks (N,T,n_assets) after expand
+if method == "Multivariate (correlated)":
+    shocks = shocks.reshape(N, T, n_assets)
+
+sim_logrets = mu.reshape(1, 1, n_assets) + shocks  # (N,T,n_assets)
+
+# Convert to simulated prices paths per asset
+# Start from last observed prices
+start_prices = last_prices.reshape(1, 1, n_assets)  # (1,1,A)
+
+# cumulative sum over time of log returns -> log price ratio
+cum = np.cumsum(sim_logrets, axis=1)  # (N,T,A)
+sim_prices = start_prices * np.exp(cum)  # (N,T,A)
+
+# Portfolio value per path over time
+port_values = np.sum(sim_prices * shares.reshape(1, 1, n_assets), axis=2)  # (N,T)
+port_values = np.concatenate([np.full((N, 1), current_value), port_values], axis=1)  # include t=0
+t_index = np.arange(port_values.shape[1])
+
+ending_values = port_values[:, -1]
+ending_return = ending_values / current_value - 1.0
+
+# Risk stats
+p5 = float(np.percentile(ending_values, 5))
+p50 = float(np.percentile(ending_values, 50))
+p95 = float(np.percentile(ending_values, 95))
+
+var_95_loss = float(np.percentile(current_value - ending_values, 95))  # 95% VaR (loss)
+cvar_95_loss = float(np.mean((current_value - ending_values)[(current_value - ending_values) >= var_95_loss]))
+
+# ----------------------------
+# Display summary
+# ----------------------------
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Current Portfolio Value", format_money(current_value))
+m2.metric("Median Ending Value", format_money(p50))
+m3.metric("5th–95th Ending Range", f"{format_money(p5)}  →  {format_money(p95)}")
+m4.metric("Median Return", f"{(p50/current_value - 1)*100:.2f}%")
+
+st.caption(f"VaR(95%) loss: {format_money(var_95_loss)} | CVaR(95%) loss: {format_money(cvar_95_loss)}")
+
+# ----------------------------
+# Plot 1: Sample paths
+# ----------------------------
+st.subheader("Simulated Portfolio Value Paths")
+
+# Downsample paths to plot (so browser doesn’t die)
+max_paths_to_plot = 200
+idx = np.linspace(0, N - 1, min(N, max_paths_to_plot)).astype(int)
+paths_plot = port_values[idx, :]
+
+fig_paths = go.Figure()
+for i in range(paths_plot.shape[0]):
+    fig_paths.add_trace(go.Scatter(
+        x=t_index,
+        y=paths_plot[i],
+        mode="lines",
+        line=dict(width=1),
+        opacity=0.25,
+        showlegend=False
+    ))
+
+# Add percentile bands
+pctl5 = np.percentile(port_values, 5, axis=0)
+pctl50 = np.percentile(port_values, 50, axis=0)
+pctl95 = np.percentile(port_values, 95, axis=0)
+
+fig_paths.add_trace(go.Scatter(x=t_index, y=pctl50, mode="lines", name="Median", line=dict(width=3)))
+fig_paths.add_trace(go.Scatter(x=t_index, y=pctl5, mode="lines", name="5th pct", line=dict(dash="dash")))
+fig_paths.add_trace(go.Scatter(x=t_index, y=pctl95, mode="lines", name="95th pct", line=dict(dash="dash")))
+
+fig_paths.update_layout(
+    template="plotly_white",
+    height=520,
+    margin=dict(l=20, r=20, t=30, b=20),
+    xaxis_title="Days ahead",
+    yaxis_title="Portfolio Value ($)",
+)
+st.plotly_chart(fig_paths, use_container_width=True)
+
+# ----------------------------
+# Plot 2: Distribution of ending values
+# ----------------------------
+st.subheader("Distribution of Ending Portfolio Values")
+
+end_df = pd.DataFrame({"Ending Value ($)": ending_values})
+fig_hist = px.histogram(end_df, x="Ending Value ($)", nbins=60, template="plotly_white")
+fig_hist.update_layout(height=420, margin=dict(l=20, r=20, t=10, b=20))
+st.plotly_chart(fig_hist, use_container_width=True)
+
+# ----------------------------
+# Table: key percentiles
+# ----------------------------
+st.subheader("Percentiles")
+pct_table = pd.DataFrame(
+    {
+        "Percentile": ["5%", "50% (Median)", "95%"],
+        "Ending Value": [p5, p50, p95],
+        "Return vs Now": [(p5/current_value - 1), (p50/current_value - 1), (p95/current_value - 1)],
+    }
+)
+pct_table["Ending Value"] = pct_table["Ending Value"].map(format_money)
+pct_table["Return vs Now"] = pct_table["Return vs Now"].map(lambda x: f"{x*100:.2f}%")
+st.dataframe(pct_table, use_container_width=True)
+
 with st.expander("Debug (ticker/data checks)"):
-    st.write("Parsed tickers:", tickers)
-    st.write("Latest prices used:", latest.to_dict())
-    st.write("Historical columns returned:", list(price_hist.columns))
-    st.write("Historical date range:", price_hist.index.min(), "→", price_hist.index.max())
+    st.write("Tickers used:", list(prices.columns))
+    st.write("Price date range:", prices.index.min(), "→", prices.index.max())
+    st.write("Last prices:", dict(zip(prices.columns, last_prices)))
