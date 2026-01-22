@@ -7,7 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Monte Carlo Simulation", layout="wide")
-st.title("Monte Carlo Simulation (Single Ticker)")
+st.title("Monte Carlo Simulation")
+st.caption("Simulates future prices using historical daily log returns (GBM-style).")
 
 # ---------------------------
 # Helpers
@@ -43,7 +44,10 @@ ticker = clean_ticker(st.sidebar.text_input("Ticker", "AAPL"))
 
 years = st.sidebar.slider("Years of history", 1, 15, 5)
 horizon_days = st.sidebar.slider("Forecast horizon (trading days)", 5, 2000, 252)
-n_sims = st.sidebar.slider("Simulations", 500, 20000, 5000, step=500)
+
+# MAX 400 simulations
+n_sims = st.sidebar.slider("Simulations (max 400)", 50, 400, 300, step=10)
+
 seed = st.sidebar.number_input("Random seed", 0, 10_000_000, 42)
 
 run = st.sidebar.button("Run simulation", type="primary", use_container_width=True)
@@ -94,11 +98,10 @@ paths = S0 * np.exp(np.cumsum(increments, axis=1))
 paths = np.concatenate([np.full((N, 1), S0), paths], axis=1)
 
 ending = paths[:, -1]
-
 p5, p50, p95 = np.percentile(ending, [5, 50, 95])
 
 # ---------------------------
-# Display key result
+# Key result
 # ---------------------------
 st.subheader("Final Price Statistics")
 
@@ -107,42 +110,46 @@ m1.metric("5th Percentile", f"{p5:,.2f}")
 m2.metric("Median Final Price", f"{p50:,.2f}")
 m3.metric("95th Percentile", f"{p95:,.2f}")
 
-st.caption(f"Horizon: {T} trading days")
+st.caption(f"Horizon: {T} trading days | Simulations: {N}")
 
 # ---------------------------
 # Plot 1: Paths
 # ---------------------------
 st.subheader("Simulated Price Paths")
 
-max_plot = 200
-idx = np.linspace(0, N-1, min(N, max_plot)).astype(int)
-sample = paths[idx, :]
-
-t_index = np.arange(sample.shape[1])
+t_index = np.arange(paths.shape[1])
 
 fig_paths = go.Figure()
 
-for i in range(sample.shape[0]):
+# Plot all paths (<= 400)
+for i in range(paths.shape[0]):
     fig_paths.add_trace(go.Scatter(
         x=t_index,
-        y=sample[i],
+        y=paths[i],
         mode="lines",
         opacity=0.25,
         line=dict(width=1),
         showlegend=False
     ))
 
-# Percentile bands
-fig_paths.add_trace(go.Scatter(x=t_index, y=np.percentile(paths,50,axis=0),
-                               name="Median", line=dict(width=3)))
-fig_paths.add_trace(go.Scatter(x=t_index, y=np.percentile(paths,5,axis=0),
-                               name="5th pct", line=dict(dash="dash")))
-fig_paths.add_trace(go.Scatter(x=t_index, y=np.percentile(paths,95,axis=0),
-                               name="95th pct", line=dict(dash="dash")))
+# Percentile bands over time
+fig_paths.add_trace(go.Scatter(
+    x=t_index, y=np.percentile(paths, 50, axis=0),
+    name="Median", line=dict(width=3)
+))
+fig_paths.add_trace(go.Scatter(
+    x=t_index, y=np.percentile(paths, 5, axis=0),
+    name="5th pct", line=dict(dash="dash")
+))
+fig_paths.add_trace(go.Scatter(
+    x=t_index, y=np.percentile(paths, 95, axis=0),
+    name="95th pct", line=dict(dash="dash")
+))
 
 fig_paths.update_layout(
     template="plotly_white",
     height=520,
+    margin=dict(l=20, r=20, t=20, b=20),
     xaxis_title="Days Ahead",
     yaxis_title="Simulated Price"
 )
@@ -155,14 +162,19 @@ st.plotly_chart(fig_paths, use_container_width=True)
 st.subheader("Distribution of Final Prices")
 
 end_df = pd.DataFrame({"Final Price": ending})
+fig_hist = px.histogram(end_df, x="Final Price", nbins=40, template="plotly_white")
 
-fig_hist = px.histogram(end_df, x="Final Price", nbins=60, template="plotly_white")
+# Median line (explicitly demonstrated)
+fig_hist.add_vline(
+    x=p50,
+    line_width=3,
+    line_dash="dash",
+    line_color="black",
+    annotation_text="Median",
+    annotation_position="top right",
+)
 
-# Median line
-fig_hist.add_vline(x=p50, line_width=3, line_dash="dash", line_color="black",
-                   annotation_text="Median", annotation_position="top right")
-
-fig_hist.update_layout(height=420)
+fig_hist.update_layout(height=420, margin=dict(l=20, r=20, t=20, b=20))
 st.plotly_chart(fig_hist, use_container_width=True)
 
 # ---------------------------
@@ -171,4 +183,4 @@ st.plotly_chart(fig_hist, use_container_width=True)
 with st.expander("Debug"):
     st.write("Ticker:", ticker)
     st.write("Price range:", prices.index.min().date(), "→", prices.index.max().date())
-    st.dataframe(prices.tail(10))
+    st.dataframe(prices.tail(10), use_container_width=True)
