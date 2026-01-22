@@ -1,5 +1,3 @@
-# arima_app.py  (Streamlit + Plotly, fixed chart rendering)
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -14,13 +12,40 @@ st.title("ARIMA Forecast + Walk-Forward Backtest (Interactive)")
 # ----------------------------
 # Helpers
 # ----------------------------
+def _to_series(x, name: str) -> pd.Series:
+    """Force x into a 1D float Series with clean datetime index."""
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+    if not isinstance(x, pd.Series):
+        x = pd.Series(x)
+
+    x = x.copy()
+    x.name = name
+    x.index = pd.to_datetime(x.index, errors="coerce")
+    # remove timezone if any
+    try:
+        x.index = x.index.tz_localize(None)
+    except Exception:
+        pass
+
+    x = pd.to_numeric(x, errors="coerce")
+    x = x.replace([np.inf, -np.inf], np.nan).dropna()
+    return x
+
+
 @st.cache_data(show_spinner=False)
 def get_price_series(ticker: str, years: int) -> pd.Series:
     end = pd.Timestamp.today().normalize()
     start = end - pd.Timedelta(days=365 * years)
 
-    # auto_adjust=True => adjusted close is "Close"
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+    df = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=True,   # adjusted close -> "Close"
+        threads=True,
+    )
     if df is None or df.empty:
         raise ValueError(f"No data returned for {ticker}. Check ticker.")
 
@@ -28,16 +53,23 @@ def get_price_series(ticker: str, years: int) -> pd.Series:
         raise ValueError("Yahoo response missing 'Close' column.")
 
     price = df["Close"].dropna()
-    price.index = pd.to_datetime(price.index).tz_localize(None)
+    price.index = pd.to_datetime(price.index)
+    try:
+        price.index = price.index.tz_localize(None)
+    except Exception:
+        pass
+
+    # business-day frequency
     price = price.asfreq("B").ffill()
-    price = price.astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-    price.name = "price"
+
+    # force to clean series
+    price = _to_series(price, "price")
     return price
 
 
 def adf_pvalue(series: pd.Series) -> float:
-    _, pvalue, *_ = adfuller(series.dropna())
-    return float(pvalue)
+    _, pval, *_ = adfuller(series.dropna())
+    return float(pval)
 
 
 def rmse(a, b) -> float:
@@ -59,7 +91,7 @@ def walk_forward_backtest_arima(
     horizon: int = 5,
     step: int = 5,
 ):
-    returns = returns.dropna().astype(float)
+    returns = _to_series(returns, "returns")
 
     if initial_train < 100:
         raise ValueError("Initial train too small; try 300–800 for daily data.")
@@ -76,7 +108,8 @@ def walk_forward_backtest_arima(
         try:
             res = ARIMA(train, order=order).fit()
             fc = res.get_forecast(steps=horizon).predicted_mean
-            fc = pd.Series(fc, index=test.index).astype(float)
+            fc = pd.Series(fc, index=test.index)
+            fc = _to_series(fc, "pred")
         except Exception:
             i += step
             continue
@@ -91,6 +124,8 @@ def walk_forward_backtest_arima(
     pred = pd.concat(preds).sort_index()
     act = pd.concat(actuals).sort_index()
     pred, act = pred.align(act, join="inner")
+    pred = _to_series(pred, "pred")
+    act = _to_series(act, "act")
     return pred, act
 
 
@@ -98,21 +133,20 @@ def walk_forward_backtest_arima(
 # Sidebar
 # ----------------------------
 st.sidebar.header("Inputs")
-
 ticker = st.sidebar.text_input("Ticker", value="^GSPC").strip().upper()
 years = st.sidebar.slider("Years of history", 1, 15, 5)
 
 st.sidebar.subheader("ARIMA(p,d,q)")
-p = st.sidebar.number_input("p", min_value=0, max_value=5, value=1, step=1)
-d = st.sidebar.number_input("d", min_value=0, max_value=2, value=0, step=1)
-q = st.sidebar.number_input("q", min_value=0, max_value=5, value=1, step=1)
+p = st.sidebar.number_input("p", 0, 5, 1, 1)
+d = st.sidebar.number_input("d", 0, 2, 0, 1)
+q = st.sidebar.number_input("q", 0, 5, 1, 1)
 
 forecast_days = st.sidebar.slider("Forecast business days ahead", 1, 60, 20)
 
 st.sidebar.subheader("Backtest settings")
-initial_train = st.sidebar.number_input("Initial train size (days)", min_value=100, max_value=3000, value=500, step=50)
-horizon = st.sidebar.number_input("Forecast horizon per step (days)", min_value=1, max_value=60, value=5, step=1)
-step = st.sidebar.number_input("Step size (days)", min_value=1, max_value=60, value=5, step=1)
+initial_train = st.sidebar.number_input("Initial train size (days)", 100, 3000, 500, 50)
+horizon = st.sidebar.number_input("Forecast horizon per step (days)", 1, 60, 5, 1)
+step = st.sidebar.number_input("Step size (days)", 1, 60, 5, 1)
 
 show_debug = st.sidebar.checkbox("Show debug", value=False)
 
@@ -120,8 +154,9 @@ run = st.sidebar.button("Run", type="primary", use_container_width=True)
 if not run:
     st.stop()
 
+
 # ----------------------------
-# Data
+# Load data
 # ----------------------------
 try:
     price = get_price_series(ticker, years)
@@ -129,15 +164,18 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-returns = np.log(price / price.shift(1)).dropna().astype(float)
+# log returns
+returns = np.log(price / price.shift(1)).dropna()
+returns = _to_series(returns, "returns")
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Observations (prices)", f"{len(price):,}")
 c2.metric("Observations (returns)", f"{len(returns):,}")
 c3.metric("ADF p-value (returns)", f"{adf_pvalue(returns):.4f}")
 
+
 # ----------------------------
-# Fit + Forecast (returns -> prices)
+# Fit + Forecast
 # ----------------------------
 try:
     res = ARIMA(returns, order=(int(p), int(d), int(q))).fit()
@@ -146,30 +184,26 @@ except Exception as e:
     st.stop()
 
 fc_ret = res.get_forecast(steps=int(forecast_days)).predicted_mean
-fc_ret = pd.Series(fc_ret).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+fc_ret = pd.Series(fc_ret)
+fc_ret = _to_series(fc_ret, "fc_ret")
 
 last_price = float(price.iloc[-1])
+
 fc_index = pd.bdate_range(start=price.index[-1] + pd.Timedelta(days=1), periods=len(fc_ret))
 fc_price = last_price * np.exp(fc_ret.cumsum())
-fc_price = pd.Series(fc_price.values, index=fc_index, name="Forecast").astype(float)
-fc_price.index = pd.to_datetime(fc_price.index).tz_localize(None)
-fc_price = fc_price.replace([np.inf, -np.inf], np.nan).dropna()
+fc_price = pd.Series(fc_price.values, index=fc_index, name="Forecast")
+fc_price = _to_series(fc_price, "Forecast")
 
 # ----------------------------
-# Forecast chart (Plotly, robust)
+# Forecast plot (Plotly, robust)
 # ----------------------------
 st.subheader("Forecast (Interactive)")
 
 hist_window = min(len(price), 252)
-hist = price.iloc[-hist_window:].copy()
-hist.index = pd.to_datetime(hist.index).tz_localize(None)
-hist = hist.replace([np.inf, -np.inf], np.nan).dropna()
+hist = price.iloc[-hist_window:]
+hist = _to_series(hist, "Historical")
 
-plot_df = pd.concat(
-    [hist.rename("Historical"), fc_price.rename("Forecast")],
-    axis=1
-).reset_index().rename(columns={"index": "Date"})
-
+plot_df = pd.concat([hist, fc_price], axis=1).reset_index().rename(columns={"index": "Date"})
 long_df = plot_df.melt(id_vars="Date", var_name="Series", value_name="Price").dropna()
 
 fig_forecast = px.line(
@@ -192,14 +226,14 @@ with st.expander("ARIMA Summary"):
     st.text(res.summary())
 
 if show_debug:
-    with st.expander("Debug (data checks)"):
-        st.write("Hist points:", len(hist), "Forecast points:", len(fc_price))
-        st.write("Hist date range:", hist.index.min(), "→", hist.index.max())
-        st.write("Forecast date range:", fc_price.index.min(), "→", fc_price.index.max())
+    with st.expander("Debug"):
+        st.write("hist type:", type(hist), "fc_price type:", type(fc_price))
+        st.write("hist points:", len(hist), "forecast points:", len(fc_price))
         st.dataframe(long_df.tail(20), use_container_width=True)
 
+
 # ----------------------------
-# Backtest (returns)
+# Backtest plot (returns)
 # ----------------------------
 st.subheader("Walk-forward Backtest (Interactive)")
 
@@ -215,7 +249,6 @@ except Exception as e:
     st.error(f"Backtest failed: {e}")
     st.stop()
 
-# Metrics
 ret_mae = mae(act_ret, pred_ret)
 ret_rmse = rmse(act_ret, pred_ret)
 direction_acc = float((np.sign(act_ret.values) == np.sign(pred_ret.values)).mean())
