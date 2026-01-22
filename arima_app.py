@@ -1,228 +1,244 @@
 import numpy as np
 import pandas as pd
-import datetime as dt
+import yfinance as yf
 import streamlit as st
-import plotly.express as px
+import matplotlib.pyplot as plt
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
 
-# yfinance can fail on Streamlit Cloud sometimes (network/rate limits)
-# so we import it safely
-try:
-    import yfinance as yf
-    YF_OK = True
-except Exception as e:
-    yf = None
-    YF_OK = False
-    YF_IMPORT_ERROR = str(e)
+st.set_page_config(page_title="ARIMA Stock Forecast", layout="wide")
+st.title("ARIMA Stock Forecast + Walk-Forward Backtest")
 
-st.set_page_config(page_title="Monte Carlo Simulator", layout="wide")
+# ----------------------------
+# Helpers
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def get_price_series(ticker: str, years: int) -> pd.Series:
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.Timedelta(days=365 * years)
 
-# ---------- Title
-st.markdown(
-    "<h1 style='text-align:center; font-size:64px; margin-bottom:10px;'>Monte Carlo Simulator</h1>",
-    unsafe_allow_html=True,
-)
+    df = yf.download(ticker, start=start, end=end, progress=False)
+    if df is None or df.empty:
+        raise ValueError(f"No data returned for {ticker}. Check ticker or connection.")
 
-# ---------- Inputs
-colL, colC, colR = st.columns([1, 2, 1])
-with colC:
-    ticker = st.text_input("One Ticker (Yahoo Finance)", "AAPL").strip().upper()
+    col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    price = df[col].dropna()
 
-    today = dt.date.today()
-    default_start = today - dt.timedelta(days=365 * 3)
+    price.index = pd.to_datetime(price.index)
+    price = price.asfreq("B").ffill()  # business days + fill gaps
+    price.name = "price"
+    return price.astype(float)
 
-    start_date = st.date_input("Start date", value=default_start)
-    end_date = st.date_input("End date", value=today)
 
-    st.markdown("---")
+def adf_pvalue(series: pd.Series) -> float:
+    stat, pvalue, *_ = adfuller(series.dropna())
+    return float(pvalue)
 
-    num_simulations = st.slider("Number of simulations", 50, 2000, 300, step=50)
-    num_days = st.slider("Forecast horizon (trading days)", 30, 756, 252, step=21)
 
-    seed = st.number_input("Random seed", value=42, step=1)
+def rmse(a, b) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    return float(np.sqrt(np.mean((a - b) ** 2)))
 
-    # IMPORTANT: fallback mode to prove Streamlit is working even if Yahoo fails
-    fallback_mode = st.checkbox(
-        "Fallback mode (use synthetic prices if Yahoo fails)",
-        value=True
-    )
 
-    run = st.button("Run simulation", type="primary", use_container_width=True)
+def mae(a, b) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    return float(np.mean(np.abs(a - b)))
 
-# Always show diagnostics so the app never looks blank
-with st.expander("Diagnostics (open if blank / errors)", expanded=False):
-    st.write("Python:", __import__("sys").version)
-    st.write("NumPy:", np.__version__)
-    st.write("Pandas:", pd.__version__)
-    st.write("Plotly:", px.__version__ if hasattr(px, "__version__") else "unknown")
-    st.write("yfinance import ok:", YF_OK)
-    if not YF_OK:
-        st.error(f"yfinance import failed: {YF_IMPORT_ERROR}")
+
+def returns_to_prices(start_price: float, returns: pd.Series) -> pd.Series:
+    return float(start_price) * np.exp(returns.cumsum())
+
+
+def walk_forward_backtest_arima(
+    returns: pd.Series,
+    order=(1, 0, 1),
+    initial_train: int = 500,
+    horizon: int = 5,
+    step: int = 5,
+):
+    returns = returns.dropna().astype(float)
+
+    if initial_train < 50:
+        raise ValueError("initial_train too small; use at least ~200-500 for daily data.")
+    if initial_train + horizon >= len(returns):
+        raise ValueError("Not enough data for given initial_train and horizon.")
+
+    preds, actuals = [], []
+    i = initial_train
+
+    while i + horizon <= len(returns):
+        train = returns.iloc[:i]
+        test = returns.iloc[i:i + horizon]
+
+        try:
+            res = ARIMA(train, order=order).fit()
+            fc = res.get_forecast(steps=horizon).predicted_mean
+            fc = pd.Series(fc, index=test.index).astype(float)
+        except Exception:
+            # skip failed window
+            i += step
+            continue
+
+        preds.append(fc)
+        actuals.append(test)
+        i += step
+
+    if not preds:
+        raise ValueError("Backtest failed on all windows. Try different (p,d,q) or larger history.")
+
+    pred = pd.concat(preds).sort_index()
+    act = pd.concat(actuals).sort_index()
+    pred, act = pred.align(act, join="inner")
+    return pred, act
+
+
+# ----------------------------
+# Sidebar inputs
+# ----------------------------
+st.sidebar.header("Inputs")
+
+ticker = st.sidebar.text_input("Ticker", value="AAPL").strip().upper()
+years = st.sidebar.slider("Years of history", 1, 15, 5)
+
+st.sidebar.subheader("ARIMA order (p,d,q)")
+p = st.sidebar.number_input("p", min_value=0, max_value=5, value=1, step=1)
+d = st.sidebar.number_input("d", min_value=0, max_value=2, value=0, step=1)
+q = st.sidebar.number_input("q", min_value=0, max_value=5, value=1, step=1)
+
+forecast_days = st.sidebar.slider("Forecast business days ahead", 1, 60, 20)
+
+st.sidebar.subheader("Backtest settings")
+initial_train = st.sidebar.number_input("Initial train size (days)", min_value=100, max_value=3000, value=500, step=50)
+horizon = st.sidebar.number_input("Forecast horizon per step (days)", min_value=1, max_value=60, value=5, step=1)
+step = st.sidebar.number_input("Step size (days)", min_value=1, max_value=60, value=5, step=1)
+
+run = st.sidebar.button("Run", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Set inputs and click **Run simulation**.")
     st.stop()
 
-if start_date >= end_date:
-    st.error("Start date must be before end date.")
+# ----------------------------
+# Run model
+# ----------------------------
+try:
+    price = get_price_series(ticker, years=years)
+except Exception as e:
+    st.error(str(e))
     st.stop()
 
-@st.cache_data(show_spinner=False, ttl=60 * 60)  # cache for 1 hour
-def download_prices(ticker: str, start: dt.date, end: dt.date) -> pd.Series:
-    if yf is None:
-        return pd.Series(dtype=float)
+returns = np.log(price / price.shift(1)).dropna()
 
-    try:
-        data = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            auto_adjust=False,
-            progress=False,
-            threads=False,   # sometimes safer on cloud
-        )
-        if data is None or data.empty or "Close" not in data.columns:
-            return pd.Series(dtype=float)
+pval = adf_pvalue(returns)
+colA, colB, colC = st.columns(3)
+colA.metric("Obs (prices)", f"{len(price):,}")
+colB.metric("Obs (returns)", f"{len(returns):,}")
+colC.metric("ADF p-value (returns)", f"{pval:.4f}")
 
-        s = data["Close"].dropna()
-        s.name = "Close"
-        return s
-    except Exception:
-        # return empty so caller can fallback instead of crashing
-        return pd.Series(dtype=float)
+if len(returns) < 150:
+    st.warning("Not much data. Increase years for better ARIMA stability.")
 
-def synthetic_prices(start_price: float = 100.0, n: int = 800, seed: int = 42) -> pd.Series:
-    rng = np.random.default_rng(seed)
-    # mild drift + volatility, just to test UI + simulation pipeline
-    mu = 0.0003
-    sigma = 0.015
-    rets = rng.normal(mu, sigma, size=n)
-    prices = start_price * np.exp(np.cumsum(rets))
-    idx = pd.RangeIndex(n, name="t")
-    return pd.Series(prices, index=idx, name="Close")
+# ----------------------------
+# Forecast
+# ----------------------------
+st.subheader("Forecast")
 
-with st.spinner("Downloading price data..."):
-    prices = download_prices(ticker, start_date, end_date)
-
-# If Yahoo fails, don’t crash — fallback if enabled
-if prices.empty:
-    if fallback_mode:
-        st.warning(
-            "Yahoo Finance returned no data (common on Streamlit Cloud sometimes). "
-            "Using **synthetic prices** so you can verify the app works."
-        )
-        prices = synthetic_prices(start_price=100.0, n=900, seed=int(seed))
-    else:
-        st.error(
-            f"No valid data for ticker '{ticker}'. "
-            "Try another symbol/date range, or enable fallback mode."
-        )
-        st.stop()
-
-if len(prices) < 20:
-    st.error("Not enough data points to run Monte Carlo (need at least ~20 closes).")
+try:
+    model = ARIMA(returns, order=(int(p), int(d), int(q)))
+    res = model.fit()
+except Exception as e:
+    st.error(f"ARIMA fit failed: {e}")
     st.stop()
 
-# ---------- Log returns
-log_returns = np.log(prices / prices.shift(1)).dropna()
-mu = float(log_returns.mean())
-sigma = float(log_returns.std())
-last_price = float(prices.iloc[-1])
+# forecast returns
+fc_ret = res.get_forecast(steps=int(forecast_days)).predicted_mean
+fc_ret = pd.Series(fc_ret).iloc[: int(forecast_days)].astype(float)
 
-# ---------- Vectorized Monte Carlo (FAST)
-# sim_paths shape: (num_days+1, num_simulations)
-rng = np.random.default_rng(int(seed))
+# returns -> prices
+last_price = float(price.iloc[-1])
+forecast_index = pd.bdate_range(start=price.index[-1] + pd.Timedelta(days=1), periods=len(fc_ret))
+fc_prices = last_price * np.exp(fc_ret.cumsum())
+fc_prices = pd.Series(fc_prices.values, index=forecast_index, name="forecast")
 
-# random shocks: (num_days, num_simulations)
-Z = rng.normal(0, 1, size=(int(num_days), int(num_simulations)))
+# plot: last 252 business days + forecast
+hist_window = min(len(price), 252)
+hist = price.iloc[-hist_window:]
 
-# GBM step factors: exp(mu + sigma*Z)
-steps = np.exp(mu + sigma * Z)
+fig1 = plt.figure(figsize=(12, 5))
+plt.plot(hist.index, hist.values, label="Historical", linewidth=2)
+plt.plot(fc_prices.index, fc_prices.values, label="Forecast", linestyle="--", linewidth=2)
+plt.title(f"{ticker} ARIMA({p},{d},{q}) Forecast ({forecast_days} business days)")
+plt.xlabel("Date")
+plt.ylabel("Price")
+plt.grid(alpha=0.3)
+plt.legend()
+st.pyplot(fig1)
 
-# cumulative product along days -> price paths relative to last_price
-paths = np.vstack([
-    np.ones((1, int(num_simulations))),
-    np.cumprod(steps, axis=0)
-]) * last_price
+st.write(f"Last historical price: **{last_price:.2f}**")
+st.write(f"Last forecast price: **{float(fc_prices.iloc[-1]):.2f}**")
 
-sim_paths = paths
-final_prices = sim_paths[-1, :]
+with st.expander("ARIMA Summary"):
+    st.text(res.summary())
 
-# ---------- Percentiles
-days = np.arange(0, int(num_days) + 1)
-p5 = np.percentile(sim_paths, 5, axis=1)
-p50 = np.percentile(sim_paths, 50, axis=1)
-p95 = np.percentile(sim_paths, 95, axis=1)
-bands = pd.DataFrame({"day": days, "p5": p5, "p50": p50, "p95": p95})
+# ----------------------------
+# Backtest
+# ----------------------------
+st.subheader("Walk-forward Backtest")
 
-# ---------- Summary
-up_10 = last_price * 1.10
-down_10 = last_price * 0.90
+try:
+    pred_ret, act_ret = walk_forward_backtest_arima(
+        returns,
+        order=(int(p), int(d), int(q)),
+        initial_train=int(initial_train),
+        horizon=int(horizon),
+        step=int(step),
+    )
+except Exception as e:
+    st.error(f"Backtest failed: {e}")
+    st.stop()
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Last price", f"{last_price:,.2f}")
-col2.metric("Median final", f"{np.median(final_prices):,.2f}")
-col3.metric("P(final > +10%)", f"{(final_prices > up_10).mean():.2%}")
-col4.metric("P(final < -10%)", f"{(final_prices < down_10).mean():.2%}")
+# metrics in returns space
+ret_mae = mae(act_ret, pred_ret)
+ret_rmse = rmse(act_ret, pred_ret)
+direction_acc = float((np.sign(act_ret.values) == np.sign(pred_ret.values)).mean())
 
-st.markdown(
-    "<h2 style='font-size:38px; margin-top:30px;'>Monte Carlo Paths</h2>",
-    unsafe_allow_html=True,
-)
+# convert to prices
+first_dt = pred_ret.index.min()
+prev_dt = first_dt - pd.tseries.offsets.BDay(1)
 
-# ---------- Plot paths (sample for speed/readability)
-max_to_plot = min(200, int(num_simulations))
-paths_to_plot = sim_paths[:, :max_to_plot]
+if prev_dt not in price.index:
+    # fallback: use last price before first_dt
+    prev_dt = price.index[price.index < first_dt][-1]
 
-paths_df = pd.DataFrame(paths_to_plot)
-paths_df["day"] = days
-paths_long = paths_df.melt(id_vars="day", var_name="path", value_name="price")
+start_price = float(price.loc[prev_dt])
 
-fig_paths = px.line(
-    paths_long,
-    x="day",
-    y="price",
-    color="path",
-    template="plotly_white",
-)
+pred_price = returns_to_prices(start_price, pred_ret)
+pred_price.index = pred_ret.index
+act_price = price.loc[pred_price.index]
 
-fig_paths.update_layout(
-    height=520,
-    showlegend=False,
-    margin=dict(l=20, r=20, t=10, b=40),
-    xaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-    yaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-)
+px_mae = mae(act_price, pred_price)
+px_rmse = rmse(act_price, pred_price)
 
-# Percentile lines
-fig_paths.add_scatter(x=bands["day"], y=bands["p50"], mode="lines", name="Median (50%)", line=dict(width=4))
-fig_paths.add_scatter(x=bands["day"], y=bands["p5"], mode="lines", name="5%", line=dict(width=3))
-fig_paths.add_scatter(x=bands["day"], y=bands["p95"], mode="lines", name="95%", line=dict(width=3))
+m1, m2, m3 = st.columns(3)
+m1.metric("Returns MAE", f"{ret_mae:.6f}")
+m2.metric("Returns RMSE", f"{ret_rmse:.6f}")
+m3.metric("Directional Acc.", f"{direction_acc:.2%}")
 
-fig_paths.update_layout(
-    legend=dict(
-        orientation="h",
-        yanchor="top",
-        y=-0.2,
-        xanchor="left",
-        x=0.0,
-        title=None
-    ),
-    showlegend=True,
-)
+m4, m5 = st.columns(2)
+m4.metric("Price MAE", f"{px_mae:.2f}")
+m5.metric("Price RMSE", f"{px_rmse:.2f}")
 
-st.plotly_chart(fig_paths, use_container_width=True)
+fig2 = plt.figure(figsize=(12, 5))
+plt.plot(act_price.index, act_price.values, label="Actual Price", linewidth=2)
+plt.plot(pred_price.index, pred_price.values, label="Predicted Price (walk-forward)", linestyle="--", linewidth=2)
+plt.title(f"{ticker} ARIMA({p},{d},{q}) Walk-forward Backtest")
+plt.xlabel("Date")
+plt.ylabel("Price")
+plt.grid(alpha=0.3)
+plt.legend()
+st.pyplot(fig2)
 
-st.markdown(
-    "<h2 style='font-size:38px; margin-top:30px;'>Final Price Distribution</h2>",
-    unsafe_allow_html=True,
-)
-
-hist_df = pd.DataFrame({"final_price": final_prices})
-fig_hist = px.histogram(hist_df, x="final_price", nbins=30, template="plotly_white")
-fig_hist.update_layout(
-    height=420,
-    margin=dict(l=20, r=20, t=10, b=40),
-    xaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-    yaxis=dict(title=None, showgrid=True, gridcolor="rgba(0,0,0,0.08)"),
-)
-st.plotly_chart(fig_hist, use_container_width=True)
+with st.expander("Backtest data (preview)"):
+    out = pd.DataFrame({"actual_return": act_ret, "pred_return": pred_ret})
+    st.dataframe(out.tail(50), use_container_width=True)
