@@ -56,9 +56,5 @@ typing_extensions==4.15.0
 tzdata==2025.3
 urllib3==2.6.2
 websockets==15.0.1
-yfinance==1.0
-streamlit
-plotly
-yfinance
-pandas
-numpy
+yfinance==0.2.65
+
