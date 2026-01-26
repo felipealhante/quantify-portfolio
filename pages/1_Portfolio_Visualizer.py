@@ -1,10 +1,4 @@
-# ============================================================
-# Trades (Long/Short) — Allocation + Portfolio Performance
-# Full Streamlit page code (drop into ONE .py file)
-# ============================================================
-
 import datetime as dt
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
