@@ -132,7 +132,7 @@ st.caption("Rolling historical vol • EWMA (RiskMetrics) • optional GARCH(1,1
 with st.sidebar:
     st.header("Inputs")
 
-    ticker = st.text_input("Ticker", value="NVDA")
+    ticker = st.text_input("Ticker")
     years = st.number_input("Years of history", min_value=1, max_value=30, value=5, step=1)
     window = st.number_input("Rolling window (days)", min_value=5, max_value=252, value=20, step=1)
     lam = st.slider("EWMA lambda (λ)", min_value=0.70, max_value=0.99, value=0.94, step=0.01)
