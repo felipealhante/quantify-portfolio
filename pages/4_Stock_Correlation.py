@@ -110,9 +110,9 @@ with st.sidebar:
 
     c1, c2 = st.columns(2)
     with c1:
-        t1 = st.text_input("Ticker 1", value="AAPL")
+        t1 = st.text_input("Ticker 1")
     with c2:
-        t2 = st.text_input("Ticker 2", value="NVDA")
+        t2 = st.text_input("Ticker 2"
 
     t1 = normalize_ticker(t1)
     t2 = normalize_ticker(t2)
