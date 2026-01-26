@@ -124,7 +124,7 @@ st.caption("MA15/MA60 regime signal + next-day-return backtest.")
 with st.sidebar:
     st.header("Inputs")
 
-    ticker = normalize_ticker(st.text_input("Ticker", value="AAPL"))
+    ticker = normalize_ticker(st.text_input("Ticker")
 
     today = dt.date.today()
     default_start = today - dt.timedelta(days=365 * 3)
