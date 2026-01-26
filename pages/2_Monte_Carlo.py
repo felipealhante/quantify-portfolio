@@ -39,7 +39,7 @@ def download_price(ticker: str, start: dt.date, end: dt.date) -> pd.Series:
 # ---------------------------
 st.sidebar.header("Inputs")
 
-ticker = clean_ticker(st.sidebar.text_input("Ticker", "AAPL"))
+ticker = clean_ticker(st.sidebar.text_input("Ticker"))
 
 years = st.sidebar.slider("Years of history", 1, 15, 5)
 horizon_days = st.sidebar.slider("Forecast horizon (trading days)", 5, 2000, 252)
