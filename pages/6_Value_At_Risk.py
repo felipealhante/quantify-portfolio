@@ -91,8 +91,7 @@ with st.sidebar:
     confidence_interval = st.slider("Confidence interval", min_value=0.80, max_value=0.99, value=0.95, step=0.01)
 
     tickers_input = st.text_input(
-        "Tickers (comma-separated)",
-        value="NVDA, AAPL",
+        "Tickers (comma-separated)"
         help="Example: NVDA, KC=F, AAPL",
     )
 
