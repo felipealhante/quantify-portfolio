@@ -133,7 +133,7 @@ def walk_forward_backtest_arima(
 # Sidebar
 # ----------------------------
 st.sidebar.header("Inputs")
-ticker = st.sidebar.text_input("Ticker", value="^GSPC").strip().upper()
+ticker = st.sidebar.text_input("Ticker").strip().upper()
 years = st.sidebar.slider("Years of history", 1, 15, 5)
 
 st.sidebar.subheader("ARIMA(p,d,q)")
