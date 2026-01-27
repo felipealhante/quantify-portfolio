@@ -7,7 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 st.title("Monte Carlo Simulation")
-st.caption("Simulates future prices using historical daily log returns (GBM-style).")
+st.caption("Simulates future prices using historical daily log returns.")
 
 # ---------------------------
 # Helpers
