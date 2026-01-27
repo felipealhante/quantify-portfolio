@@ -127,7 +127,7 @@ def download_prices_multi_safe(ticker: str, start: dt.date, end: dt.date) -> pd.
 # -----------------------------
 st.set_page_config(page_title="Volatility Modeling", layout="wide")
 st.title("Volatility Modeling")
-st.caption("Rolling historical vol • EWMA (RiskMetrics) • optional GARCH(1,1). Annualized for readability.")
+st.caption("Analyze and Visualize the volatility of stocks.")
 
 with st.sidebar:
     st.header("Inputs")
