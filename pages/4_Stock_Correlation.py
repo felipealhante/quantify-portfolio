@@ -102,8 +102,8 @@ def plot_one_series(x: pd.Series, title: str, ytitle: str, add_zero_line: bool =
 # -----------------------------
 # UI
 # -----------------------------
-st.title("Compare Two Tickers")
-st.caption("Normalized prices, daily log returns, and rolling correlation (Yahoo Finance).")
+st.title("Stock Correlation Simulation")
+st.caption("View how stocks correlate to one another.")
 
 with st.sidebar:
     st.header("Inputs")
@@ -112,7 +112,7 @@ with st.sidebar:
     with c1:
         t1 = st.text_input("Ticker 1")
     with c2:
-        t2 = st.text_input("Ticker 2"
+        t2 = st.text_input("Ticker 2")
 
     t1 = normalize_ticker(t1)
     t2 = normalize_ticker(t2)
