@@ -1,7 +1,7 @@
-# pages/5_crossover.py
+# pages/5_Moving_Average_Crossover.py
 
 import datetime as dt
-import numpy as np
+
 import pandas as pd
 import yfinance as yf
 import streamlit as st
@@ -18,15 +18,14 @@ def normalize_ticker(t: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def download_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
-    ticker = normalize_ticker(ticker)
-
+    """Download prices and return a clean DataFrame with a single 'Close' column."""
     df = yf.download(
         ticker,
         start=start,
         end=end,
         auto_adjust=False,
         progress=False,
-        group_by="column",   # keeps standard layout when possible
+        group_by="column",
         threads=True,
     )
 
@@ -36,15 +35,14 @@ def download_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
     df = df.copy()
     df.index = pd.to_datetime(df.index)
 
-    # --- Handle MultiIndex columns (common on cloud)
+    # --- Handle MultiIndex columns (sometimes happens depending on environment)
     if isinstance(df.columns, pd.MultiIndex):
-        # Prefer ("Close", ticker) if available
+        # Prefer ("Close", ticker) if present
         if ("Close", ticker) in df.columns:
             close = df[("Close", ticker)]
         elif ("Adj Close", ticker) in df.columns:
             close = df[("Adj Close", ticker)]
         else:
-            # Fallback: first "Close" column found
             close_cols = [c for c in df.columns if c[0] in ("Close", "Adj Close")]
             if not close_cols:
                 raise ValueError(f"Ticker '{ticker}' returned no Close/Adj Close columns.")
@@ -57,7 +55,6 @@ def download_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
             raise ValueError(f"Ticker '{ticker}' returned no Close/Adj Close columns. Columns: {list(df.columns)}")
         out = df[[col]].rename(columns={col: "Close"})
 
-    # Force numeric + clean
     out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
     out = out.dropna(subset=["Close"])
     if out.empty:
@@ -66,21 +63,21 @@ def download_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
     return out
 
 
-def build_signal(df: pd.DataFrame, buy_rule: str) -> pd.DataFrame:
+def build_signal(df: pd.DataFrame, short_col: str, long_col: str, buy_rule: str) -> pd.DataFrame:
     out = df.copy()
 
-    if buy_rule == "Buy when MA60 > MA15":
-        buy = out["MA60"] > out["MA15"]
-        sell = out["MA60"] < out["MA15"]
-    else:
-        buy = out["MA15"] > out["MA60"]
-        sell = out["MA15"] < out["MA60"]
+    if buy_rule == "Buy when LONG > SHORT":
+        buy = out[long_col] > out[short_col]
+        sell = out[long_col] < out[short_col]
+    else:  # "Buy when SHORT > LONG"
+        buy = out[short_col] > out[long_col]
+        sell = out[short_col] < out[long_col]
 
     out["Signal"] = 0
     out.loc[buy, "Signal"] = 1
     out.loc[sell, "Signal"] = -1
 
-    valid = out["MA15"].notna() & out["MA60"].notna()
+    valid = out[short_col].notna() & out[long_col].notna()
     out.loc[~valid, "Signal"] = 0
     return out
 
@@ -116,15 +113,15 @@ def add_buy_regime_vrects(fig: go.Figure, dates: pd.Series, signal: pd.Series):
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="MA Signal Backtest", layout="wide")
+st.set_page_config(page_title="Moving Average Crossover", layout="wide")
 
-st.title("MA Signal Backtest")
-st.caption("MA15/MA60 regime signal + next-day-return backtest.")
+st.title("Moving Average Crossover")
+st.caption("Analyze how different stocks are impacted by moving averages.")
 
 with st.sidebar:
     st.header("Inputs")
 
-    ticker = normalize_ticker(st.text_input("Ticker")
+    ticker = normalize_ticker(st.text_input("Ticker"))
 
     today = dt.date.today()
     default_start = today - dt.timedelta(days=365 * 3)
@@ -135,10 +132,13 @@ with st.sidebar:
     ma_short = st.number_input("Short MA window", min_value=2, max_value=400, value=15, step=1)
     ma_long = st.number_input("Long MA window", min_value=3, max_value=800, value=60, step=1)
 
+    if ma_long <= ma_short:
+        st.warning("Tip: Long MA is usually > Short MA.")
+
     st.divider()
     buy_rule = st.radio(
         "Buy / Sell rule",
-        options=["Buy when MA60 > MA15", "Buy when MA15 > MA60"],
+        options=["Buy when LONG > SHORT", "Buy when SHORT > LONG"],
         index=0,
     )
 
@@ -156,7 +156,6 @@ if start_date >= end_date:
     st.error("Start date must be before end date.")
     st.stop()
 
-
 # -----------------------------
 # Download + compute
 # -----------------------------
@@ -167,18 +166,21 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-df["MA15"] = df["Close"].rolling(int(ma_short)).mean()
-df["MA60"] = df["Close"].rolling(int(ma_long)).mean()
+short_col = f"MA{int(ma_short)}"
+long_col = f"MA{int(ma_long)}"
 
-df = build_signal(df, buy_rule)
+df[short_col] = df["Close"].rolling(int(ma_short)).mean()
+df[long_col] = df["Close"].rolling(int(ma_long)).mean()
 
+df = build_signal(df, short_col, long_col, buy_rule)
+
+# next-day return
 df["returns"] = df["Close"].pct_change().shift(-1)
 df["strategy_returns"] = df["Signal"] * df["returns"]
 df["cumulative_strategy_returns"] = (1 + df["strategy_returns"].fillna(0)).cumprod()
 
 df = df.reset_index().rename(columns={"index": "Date"})
 df["Date"] = pd.to_datetime(df["Date"])
-
 
 # -----------------------------
 # Metrics
@@ -193,7 +195,6 @@ c1.metric("Cumulative growth", f"{total_growth:.3f}x")
 c2.metric("Total strategy return", f"{total_return:.2f}%")
 c3.metric("Time in +1 / -1", f"{pct_long:.1f}% / {pct_short:.1f}%")
 
-
 # -----------------------------
 # Charts
 # -----------------------------
@@ -201,13 +202,13 @@ st.subheader("Price + MAs + Regime")
 
 fig1 = go.Figure()
 fig1.add_trace(go.Scatter(x=df["Date"], y=df["Close"], mode="lines", name="Close"))
-fig1.add_trace(go.Scatter(x=df["Date"], y=df["MA15"], mode="lines", name=f"MA{ma_short}"))
-fig1.add_trace(go.Scatter(x=df["Date"], y=df["MA60"], mode="lines", name=f"MA{ma_long}", line=dict(dash="dash")))
+fig1.add_trace(go.Scatter(x=df["Date"], y=df[short_col], mode="lines", name=short_col))
+fig1.add_trace(go.Scatter(x=df["Date"], y=df[long_col], mode="lines", name=long_col, line=dict(dash="dash")))
 
 add_buy_regime_vrects(fig1, df["Date"], df["Signal"])
 
 fig1.update_layout(
-    title=f"{ticker} — Close with MAs + Regime ({buy_rule})",
+    title=f"{ticker} — Close with {short_col}/{long_col} + Regime ({buy_rule})",
     xaxis_title="Date",
     yaxis_title="Price",
     height=520,
@@ -215,7 +216,6 @@ fig1.update_layout(
     template="plotly_dark",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
-
 st.plotly_chart(fig1, use_container_width=True)
 
 st.subheader("Signal (+1 / -1)")
@@ -231,4 +231,4 @@ fig3.update_layout(height=360, template="plotly_dark", margin=dict(l=10, r=10, t
 st.plotly_chart(fig3, use_container_width=True)
 
 with st.expander("Debug: show cleaned data"):
-    st.dataframe(df[["Date", "Close", "MA15", "MA60", "Signal"]].tail(50), use_container_width=True)
+    st.dataframe(df[["Date", "Close", short_col, long_col, "Signal"]].tail(50), use_container_width=True)
