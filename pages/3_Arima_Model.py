@@ -6,8 +6,8 @@ import plotly.express as px
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.arima.model import ARIMA
 
-st.set_page_config(page_title="ARIMA Forecast", layout="wide")
-st.title("ARIMA Forecast")
+st.set_page_config(page_title="ARIMA Forecast + Backtest", layout="wide")
+st.title("ARIMA Forecast + Walk-Forward Backtest (Interactive)")
 
 # ----------------------------
 # Helpers
