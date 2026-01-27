@@ -5,37 +5,63 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+import requests
+from urllib.parse import quote
 
-# ---------------- Page setup ----------------
-st.set_page_config(page_title="Trades (Long/Short)", layout="wide")
-st.title("Trades (Long/Short)")
-st.caption(
-    "Enter tickers + position (Long/Short) + entry price + shares. "
-    "App pulls prices from Yahoo Finance to compute exposure, P/L, allocation, and portfolio performance."
-)
+if "ran" not in st.session_state:
+    st.session_state.ran = False
 
-# ---------------- Helpers ----------------
+# =========================================================
+# CONFIG: asset-type overrides (so we don't show "Unknown")
+# =========================================================
+ASSET_OVERRIDES = {
+    # Commodities / futures (Yahoo often returns Unknown)
+    "CL=F": {"Asset Type": "Commodity (Futures)", "Sector": "Commodities", "Industry": "Energy - Oil"},
+    "NG=F": {"Asset Type": "Commodity (Futures)", "Sector": "Commodities", "Industry": "Energy - Natural Gas"},
+    "GC=F": {"Asset Type": "Commodity (Futures)", "Sector": "Commodities", "Industry": "Precious Metals"},
+    "SI=F": {"Asset Type": "Commodity (Futures)", "Sector": "Commodities", "Industry": "Precious Metals"},
+    # Indices / FX examples
+    "^GSPC": {"Asset Type": "Index", "Sector": "Index", "Industry": "Index"},
+    "^IXIC": {"Asset Type": "Index", "Sector": "Index", "Industry": "Index"},
+    "EURUSD=X": {"Asset Type": "FX", "Sector": "FX", "Industry": "FX"},
+}
+
+# Contract multipliers (fix P/L for futures)
+DEFAULT_MULTIPLIERS = {
+    "CL=F": 1000,   # WTI: 1 contract = 1000 barrels
+    "NG=F": 10000,  # Henry Hub: often 10,000 MMBtu (Yahoo symbol = NG=F)
+    "GC=F": 100,    # Gold: 100 oz
+    "SI=F": 5000,   # Silver: 5,000 oz
+}
+
+# =========================================================
+# PAGE SETUP
+# =========================================================
+st.set_page_config(page_title="Portfolio Manager", layout="wide")
+st.title("Portfolio Manager")
+st.caption("Visualize your portfolio in a multitude of ways.")
+
+# =========================================================
+# HELPERS
+# =========================================================
 def normalize_tickers(raw: str) -> list[str]:
-    parts = []
-    for chunk in raw.replace("\n", ",").replace(" ", ",").split(","):
-        t = chunk.strip().upper().replace("ˆ", "^")  # mac caret fix
-        if t:
-            parts.append(t)
-    seen, out = set(), []
-    for t in parts:
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
-
+    return list(dict.fromkeys(
+        t.strip().upper().replace("ˆ", "^")
+        for t in raw.replace("\n", ",").replace(" ", ",").split(",")
+        if t.strip()
+    ))
 
 @st.cache_data(show_spinner=False)
-def download_adj_close(tickers: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
+def download_prices(tickers, start, end):
+    tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    if not tickers:
+        return pd.DataFrame()
+
     df = yf.download(
-        tickers,
+        tickers=tickers,
         start=start,
         end=end,
-        auto_adjust=True,   # adjusted close becomes "Close"
+        auto_adjust=True,
         progress=False,
         group_by="column",
         threads=True,
@@ -53,131 +79,216 @@ def download_adj_close(tickers: list[str], start: dt.date, end: dt.date) -> pd.D
         close = df[["Close"]].copy()
         close.columns = [tickers[0]]
 
-    close = close.dropna(how="all").ffill()
-    # Ensure string columns
+    close = close.ffill().dropna(how="all")
     close.columns = close.columns.astype(str)
     return close
 
-
-
 @st.cache_data(show_spinner=False)
-def get_latest_prices(tickers: list[str]) -> pd.Series:
-    # Uses last available close from recent history
-    tickers = [t for t in tickers if isinstance(t, str) and t.strip()]
-    if not tickers:
-        return pd.Series(dtype=float)
-
+def latest_prices(tickers):
     end = dt.date.today()
-    start = end - dt.timedelta(days=20)  # a bit wider window
-
-    px_df = download_adj_close(tickers, start, end)
+    start = end - dt.timedelta(days=30)
+    px_df = download_prices(tickers, start, end)
     if px_df.empty:
         return pd.Series(dtype=float)
-
-    # Drop rows where ALL tickers are NaN (more correct than dropna() which drops any row with any NaN)
-    px_df = px_df.dropna(how="all")
-    if px_df.empty:
-        return pd.Series(dtype=float)
-
     last = px_df.iloc[-1].dropna()
-    if last.empty:
-        return pd.Series(dtype=float)
-
     last.index = last.index.astype(str)
     return last.astype(float)
 
+def infer_asset_type(ticker: str) -> str:
+    t = str(ticker).upper().strip()
+    if t in ASSET_OVERRIDES:
+        return ASSET_OVERRIDES[t]["Asset Type"]
+    if t.startswith("^"):
+        return "Index"
+    if t.endswith("=X"):
+        return "FX"
+    if t.endswith("=F") or t in DEFAULT_MULTIPLIERS:
+        return "Commodity (Futures)"
+    if t.endswith("-USD"):
+        return "Crypto"
+    return "Equity"
 
+@st.cache_data(show_spinner=False)
+def get_sector_industry(tickers):
+    """
+    Returns Sector/Industry/Asset Type. If Yahoo gives missing/Unknown, we replace with asset-type defaults.
+    """
+    rows = []
+    for t in tickers:
+        t = str(t).strip().upper()
+        if not t:
+            continue
 
-# ---------------- Sidebar UI ----------------
+        # Overrides first
+        if t in ASSET_OVERRIDES:
+            o = ASSET_OVERRIDES[t]
+            rows.append({"Ticker": t, "Asset Type": o["Asset Type"], "Sector": o["Sector"], "Industry": o["Industry"]})
+            continue
+
+        asset_type = infer_asset_type(t)
+
+        # Try Yahoo info (best-effort)
+        sector = None
+        industry = None
+        try:
+            info = yf.Ticker(t).info or {}
+            sector = info.get("sector")
+            industry = info.get("industry")
+        except Exception:
+            pass
+
+        # Replace missing/unknown with meaningful labels
+        if not sector or str(sector).strip().lower() == "unknown":
+            sector = asset_type
+        if not industry or str(industry).strip().lower() == "unknown":
+            industry = asset_type
+
+        rows.append({"Ticker": t, "Asset Type": asset_type, "Sector": sector, "Industry": industry})
+
+    if not rows:
+        return pd.DataFrame(columns=["Asset Type", "Sector", "Industry"]).set_index(pd.Index([], name="Ticker"))
+
+    return pd.DataFrame(rows).set_index("Ticker")
+
+@st.cache_data(show_spinner=False, ttl=600)
+def yahoo_news(ticker, n=10):
+    t = str(ticker).strip().upper()
+    try:
+        items = yf.Ticker(t).news or []
+    except Exception:
+        items = []
+    rows = []
+    for it in items[:n]:
+        ts = it.get("providerPublishTime")
+        title = (it.get("title") or "").strip()
+        link = (it.get("link") or "").strip()
+        publisher = (it.get("publisher") or "").strip()
+        when = pd.to_datetime(ts, unit="s").strftime("%Y-%m-%d %H:%M") if ts else ""
+        rows.append({"time": when, "title": title, "publisher": publisher, "link": link})
+    return pd.DataFrame(rows)
+
+@st.cache_data(show_spinner=False, ttl=600)
+def google_news(ticker, n=10):
+    url = f"https://news.google.com/rss/search?q={quote(ticker + ' stock')}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        xml = r.text
+    except Exception:
+        return pd.DataFrame(columns=["time", "title", "publisher", "link"])
+
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml)
+
+    rows = []
+    for item in root.findall(".//item")[:n]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        source_el = item.find("source")
+        publisher = (source_el.text.strip() if source_el is not None and source_el.text else "").strip()
+        rows.append({"time": pub_date, "title": title, "publisher": publisher, "link": link})
+
+    return pd.DataFrame(rows)
+
+def render_news(df: pd.DataFrame, max_items: int):
+    if df is None or df.empty:
+        st.info("No news found.")
+        return
+
+    df = df.copy()
+    for c in ["title", "link", "publisher", "time"]:
+        df[c] = df[c].fillna("").astype(str).str.strip()
+
+    df = df[df["title"] != ""]
+    if df.empty:
+        st.info("News returned, but titles were empty.")
+        return
+
+    for _, row in df.head(max_items).iterrows():
+        title, link = row["title"], row["link"]
+        pub = row["publisher"] or "Unknown source"
+        when = row["time"]
+        if link:
+            st.markdown(f"- **[{title}]({link})**  \n  {pub} · {when}")
+        else:
+            st.markdown(f"- **{title}**  \n  {pub} · {when}")
+
+# =========================================================
+# SIDEBAR INPUTS
+# =========================================================
 with st.sidebar:
     st.header("Inputs")
+    tickers = normalize_tickers(st.text_area("Tickers (comma separated)"))
+    start_date = st.date_input("Performance start", dt.date.today() - dt.timedelta(days=365))
+    end_date = st.date_input("Performance end", dt.date.today())
+    show_pie = st.checkbox("Show exposure pie chart", True)
+    show_debug = st.checkbox("Show debug", False)
 
-    tickers_raw = st.text_area("Tickers (comma-separated)", height=80)
-    tickers = normalize_tickers(tickers_raw)
-
-    today = dt.date.today()
-    default_start = today - dt.timedelta(days=365)
-
-    start_date = st.date_input("Performance start date", value=default_start)
-    end_date = st.date_input("Performance end date", value=today)
-
-    st.divider()
-    st.header("Options")
-    show_exposure_pie = st.checkbox("Show exposure pie chart", value=True)
-    show_debug = st.checkbox("Show debug details", value=False)
-
-# Basic validations
 if not tickers:
     st.info("Add at least one ticker.")
     st.stop()
 
 if start_date >= end_date:
-    st.error("Start date must be before end date.")
+    st.error("Start must be before end.")
     st.stop()
 
-# ---------------- Trade inputs table ----------------
+# =========================================================
+# TRADE INPUTS
+# =========================================================
 st.markdown("### Trade inputs")
-st.write(
-    "Enter **Position** (Long/Short), **Entry Price** (buy for Long, short-sell for Short), and **Shares**. "
-    "If Shares is blank/0, it defaults to 1."
-)
 
-base_df = pd.DataFrame(
-    {
-        "Ticker": tickers,
-        "Position": ["Long"] * len(tickers),
-        "Entry Price": [np.nan] * len(tickers),
-        "Exit Price (optional)": [np.nan] * len(tickers),
-        "Shares": [1.0] * len(tickers),
-    }
-)
+
+base = pd.DataFrame({
+    "Ticker": tickers,
+    "Position": ["Long"] * len(tickers),
+    "Entry Price": [np.nan] * len(tickers),
+    "Shares": [1.0] * len(tickers),
+    "Multiplier": [float(DEFAULT_MULTIPLIERS.get(t, 1.0)) for t in tickers],
+})
 
 edited = st.data_editor(
-    base_df,
-    use_container_width=True,
+    base,
     hide_index=True,
+    use_container_width=True,
     column_config={
         "Ticker": st.column_config.TextColumn(disabled=True),
-        "Position": st.column_config.SelectboxColumn(
-            options=["Long", "Short"],
-            help="Long = buy first. Short = sell first (profit if price falls).",
-        ),
-        "Entry Price": st.column_config.NumberColumn(
-            min_value=0.0,
-            step=0.01,
-            help="Long: buy price. Short: short-sell price.",
-        ),
-        "Exit Price (optional)": st.column_config.NumberColumn(
-            min_value=0.0,
-            step=0.01,
-            help="Optional. Long: sell price. Short: cover price.",
-        ),
+        "Position": st.column_config.SelectboxColumn(options=["Long", "Short"]),
+        "Entry Price": st.column_config.NumberColumn(min_value=0.0, step=0.01),
         "Shares": st.column_config.NumberColumn(min_value=0.0, step=1.0),
+        "Multiplier": st.column_config.NumberColumn(min_value=0.0, step=1.0, help="Stocks=1. Futures use contract multiplier."),
     },
 )
 
 run = st.button("Run", type="primary", use_container_width=True)
-if not run:
+
+if run:
+    st.session_state.ran = True
+
+if not st.session_state.ran:
     st.stop()
 
-# ---------------- Validate & normalize inputs ----------------
+
 inputs = edited.copy()
 inputs["Ticker"] = inputs["Ticker"].astype(str).str.upper().str.strip()
-inputs["Position"] = inputs["Position"].astype(str)
+inputs["Position"] = inputs["Position"].astype(str).str.strip()
 
 inputs["Shares"] = pd.to_numeric(inputs["Shares"], errors="coerce").fillna(1.0)
 inputs.loc[inputs["Shares"] <= 0, "Shares"] = 1.0
 
+inputs["Multiplier"] = pd.to_numeric(inputs["Multiplier"], errors="coerce").fillna(1.0)
+inputs.loc[inputs["Multiplier"] <= 0, "Multiplier"] = 1.0
+
 inputs["Entry Price"] = pd.to_numeric(inputs["Entry Price"], errors="coerce")
 if inputs["Entry Price"].isna().any():
-    st.error("Please fill in Entry Price for all tickers.")
+    st.error("Fill all entry prices.")
     st.stop()
 
-inputs["Exit Price (optional)"] = pd.to_numeric(inputs["Exit Price (optional)"], errors="coerce")
-
-# ---------------- Latest prices + snapshot metrics ----------------
+# =========================================================
+# SNAPSHOT METRICS
+# =========================================================
 with st.spinner("Fetching latest prices..."):
-    latest = get_latest_prices(list(inputs["Ticker"]))
+    latest = latest_prices(inputs["Ticker"].tolist())
 
 missing = [t for t in inputs["Ticker"] if t not in latest.index]
 if missing:
@@ -185,181 +296,178 @@ if missing:
 
 inputs = inputs[inputs["Ticker"].isin(latest.index)].copy()
 if inputs.empty:
-    st.error("No usable tickers after price fetch.")
+    st.error("No usable tickers after fetching prices.")
     st.stop()
 
 inputs["Last Price"] = inputs["Ticker"].map(latest.to_dict()).astype(float)
 
-# If user provided Exit Price, use it as reference; otherwise use latest
-inputs["Ref Price"] = np.where(
-    inputs["Exit Price (optional)"].notna(),
-    inputs["Exit Price (optional)"],
-    inputs["Last Price"],
-).astype(float)
+# Exposure and P/L use multiplier (FIXED)
+inputs["Exposure"] = (inputs["Entry Price"] * inputs["Shares"] * inputs["Multiplier"]).abs()
 
-# Exposure (absolute) used for weights
-inputs["Exposure"] = (inputs["Entry Price"] * inputs["Shares"]).abs()
-
-# Signed notional for informational net exposure
-inputs["Signed Notional"] = np.where(
-    inputs["Position"] == "Long",
-    inputs["Entry Price"] * inputs["Shares"],
-    -inputs["Entry Price"] * inputs["Shares"],
-)
-
-# Signed mark value
-inputs["Signed Mkt Value"] = np.where(
-    inputs["Position"] == "Long",
-    inputs["Last Price"] * inputs["Shares"],
-    -inputs["Last Price"] * inputs["Shares"],
-)
-
-# P/L in currency
 inputs["P/L"] = np.where(
-    inputs["Position"] == "Long",
-    (inputs["Ref Price"] - inputs["Entry Price"]) * inputs["Shares"],
-    (inputs["Entry Price"] - inputs["Ref Price"]) * inputs["Shares"],
+    inputs["Position"].str.lower() == "long",
+    (inputs["Last Price"] - inputs["Entry Price"]) * inputs["Shares"] * inputs["Multiplier"],
+    (inputs["Entry Price"] - inputs["Last Price"]) * inputs["Shares"] * inputs["Multiplier"],
 )
-
-# P/L % vs exposure
 inputs["P/L %"] = np.where(inputs["Exposure"] > 0, inputs["P/L"] / inputs["Exposure"], np.nan)
 
-total_exposure = float(inputs["Exposure"].sum())
-net_notional = float(inputs["Signed Notional"].sum())
-total_pl = float(inputs["P/L"].sum())
-
-m1, m2, m3 = st.columns(3)
-m1.metric("Total Exposure", f"{total_exposure:,.2f}")
-m2.metric("Net Notional", f"{net_notional:,.2f}")
-m3.metric("Total P/L", f"{total_pl:,.2f}")
-
-inputs["Weight"] = np.where(total_exposure > 0, inputs["Exposure"] / total_exposure, np.nan)
-
-# ---------------- Allocation visuals ----------------
-if show_exposure_pie:
-    st.markdown("### Allocation (by exposure)")
-    fig_pie = px.pie(
-        inputs,
-        names="Ticker",
-        values="Exposure",
-        hole=0.45,
-        template="plotly_white",
-    )
-    fig_pie.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig_pie, use_container_width=True)
+# Add Sector/Industry/Asset Type (NO UNKNOWN)
+cls = get_sector_industry(inputs["Ticker"].tolist())
+inputs = inputs.merge(cls.reset_index(), on="Ticker", how="left")
+inputs["Asset Type"] = inputs["Asset Type"].fillna(inputs["Ticker"].map(infer_asset_type))
+inputs["Sector"] = inputs["Sector"].fillna(inputs["Asset Type"])
+inputs["Industry"] = inputs["Industry"].fillna(inputs["Asset Type"])
 
 st.markdown("### Holdings summary")
-show_df = inputs[
-    ["Ticker", "Position", "Shares", "Entry Price", "Last Price", "Exit Price (optional)", "Exposure", "P/L", "P/L %", "Weight"]
-].copy()
-show_df["P/L %"] = show_df["P/L %"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
-show_df["Weight"] = show_df["Weight"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
-st.dataframe(show_df, use_container_width=True)
+show_inputs = inputs.copy()
+# pretty percent
+show_inputs["P/L %"] = show_inputs["P/L %"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
+st.dataframe(show_inputs, use_container_width=True)
 
-# ---------------- Portfolio performance (index=100) ----------------
+# Allocation pie
+if show_pie:
+    st.markdown("## Allocation (by Exposure)")
+    pie_df = inputs[["Ticker", "Exposure"]].copy()
+    pie_df = pie_df[pie_df["Exposure"] > 0]
+    if pie_df.empty:
+        st.info("No exposure to plot.")
+    else:
+        fig_alloc = px.pie(
+            pie_df, names="Ticker", values="Exposure", hole=0.45,
+            title="Exposure Allocation", template="plotly_white",
+        )
+        fig_alloc.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+        st.plotly_chart(fig_alloc, use_container_width=True)
+
+# =========================================================
+# HISTORICAL PRICES
+# =========================================================
+with st.spinner("Downloading historical prices..."):
+    prices = download_prices(inputs["Ticker"].tolist(), start_date, end_date)
+
+if prices.empty:
+    st.error("No historical data.")
+    st.stop()
+
+# =========================================================
+# PER-TICKER PERFORMANCE (P/L-BASED)
+# =========================================================
+st.markdown("## Portfolio Performance (Per Stock)")
+
+equity = pd.DataFrame(index=prices.index)
+
+for _, r in inputs.iterrows():
+    t = r["Ticker"]
+    entry = float(r["Entry Price"])
+    shares = float(r["Shares"])
+    mult = float(r["Multiplier"])
+    exposure = float(r["Exposure"])
+    pos = str(r["Position"]).strip().lower()
+
+    if pos == "long":
+        pl = (prices[t] - entry) * shares * mult
+    else:
+        pl = (entry - prices[t]) * shares * mult
+
+    equity[t] = 100.0 * (1.0 + (pl / exposure))
+
+perf_long = equity.reset_index().rename(columns={"index": "Date"}).melt(
+    id_vars="Date",
+    var_name="Ticker",
+    value_name="Performance (start=100)",
+)
+
+fig_each = px.line(
+    perf_long,
+    x="Date",
+    y="Performance (start=100)",
+    color="Ticker",
+    title="Per-Stock Performance (P/L-based, Start = 100)",
+    template="plotly_white",
+)
+fig_each.update_layout(height=600, margin=dict(l=20, r=20, t=60, b=40))
+fig_each.update_xaxes(rangeslider=dict(visible=True))
+st.plotly_chart(fig_each, use_container_width=True)
+
+# =========================================================
+# PORTFOLIO LINE (CORRECT)
+# =========================================================
 st.markdown("## Portfolio Performance")
 
-with st.spinner("Downloading historical prices..."):
-    price_hist = download_adj_close(list(inputs["Ticker"]), start_date, end_date)
+weights = inputs["Exposure"].astype(float).values
+weights = weights / weights.sum() if weights.sum() != 0 else np.ones_like(weights) / len(weights)
 
-if price_hist is None or price_hist.empty:
-    st.error("No historical data returned for the selected date range.")
-    st.stop()
+returns = (equity.values / 100.0 - 1.0)
+port_ret = (returns * weights[None, :]).sum(axis=1)
 
-# Clean and align
-price_hist = price_hist.dropna(axis=1, how="all").ffill().dropna()
-if price_hist.empty:
-    st.error("No historical data after cleaning (all NaNs).")
-    st.stop()
+port_index = 100.0 * (1.0 + port_ret)
+port_index = 100.0 * (port_index / port_index[0])
 
-hold = inputs.copy()
-hold["Ticker"] = hold["Ticker"].astype(str).str.upper().str.strip()
-hold = hold.set_index("Ticker")
+port_df = pd.DataFrame({"Date": prices.index, "Portfolio (start=100)": port_index})
 
-tickers_used = [t for t in price_hist.columns.astype(str) if t in hold.index]
-if not tickers_used:
-    st.error("Downloaded history doesn't match your tickers (after cleaning).")
-    st.stop()
-
-price_hist = price_hist[tickers_used]
-hold = hold.reindex(tickers_used)
-
-prices = price_hist.values.astype(float)                 # (T, N)
-shares = hold["Shares"].astype(float).values             # (N,)
-entry = hold["Entry Price"].astype(float).values         # (N,)
-pos = hold["Position"].astype(str).values                # (N,)
-
-# Per-ticker P/L over time
-pl_tn = np.where(
-    (pos == "Long")[None, :],
-    (prices - entry[None, :]) * shares[None, :],
-    (entry[None, :] - prices) * shares[None, :],
-)
-
-pl_t = pl_tn.sum(axis=1)
-
-# Start equity = total absolute entry exposure (gives stable index=100)
-abs_exposure = float(np.sum(np.abs(entry * shares)))
-if abs_exposure <= 0:
-    abs_exposure = 1.0
-
-equity = abs_exposure + pl_t
-if equity[0] == 0:
-    st.error("Equity at start is 0; cannot compute indexed performance.")
-    st.stop()
-
-equity_index = 100.0 * (equity / equity[0])
-
-perf_df = pd.DataFrame(
-    {"Date": price_hist.index, "Portfolio (start=100)": equity_index, "Equity ($)": equity, "P/L ($)": pl_t}
-)
-
-fig_perf = go.Figure()
-fig_perf.add_trace(
-    go.Scatter(
-        x=perf_df["Date"],
-        y=perf_df["Portfolio (start=100)"],
-        mode="lines",
-        name="Portfolio",
-        hovertemplate="Date: %{x}<br>Index: %{y:.2f}<extra></extra>",
-    )
-)
-fig_perf.update_layout(
+fig_port = px.line(
+    port_df, x="Date", y="Portfolio (start=100)",
+    title="Portfolio Performance (Start = 100)",
     template="plotly_white",
-    height=520,
-    margin=dict(l=20, r=20, t=10, b=40),
 )
-fig_perf.update_xaxes(title="Date", rangeslider=dict(visible=True))
-fig_perf.update_yaxes(title="Portfolio (start=100)")
-st.plotly_chart(fig_perf, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
+fig_port.update_layout(height=420, margin=dict(l=20, r=20, t=60, b=40))
+fig_port.update_xaxes(rangeslider=dict(visible=True))
+st.plotly_chart(fig_port, use_container_width=True)
 
 # Drawdown
-st.markdown("### Drawdown")
-equity_series = pd.Series(equity, index=price_hist.index)
-drawdown = equity_series / equity_series.cummax() - 1.0
-dd_df = pd.DataFrame({"Date": drawdown.index, "Drawdown": drawdown.values})
+st.markdown("### Drawdown (Portfolio)")
+eq = pd.Series(port_index, index=prices.index)
+dd = eq / eq.cummax() - 1.0
+dd_df = pd.DataFrame({"Date": dd.index, "Drawdown": dd.values})
 
 fig_dd = go.Figure()
-fig_dd.add_trace(
-    go.Scatter(
-        x=dd_df["Date"],
-        y=dd_df["Drawdown"],
-        mode="lines",
-        name="Drawdown",
-        hovertemplate="Date: %{x}<br>Drawdown: %{y:.2%}<extra></extra>",
-    )
-)
-fig_dd.update_layout(
-    template="plotly_white",
-    height=260,
-    margin=dict(l=20, r=20, t=10, b=40),
-)
-fig_dd.update_xaxes(title="Date", rangeslider=dict(visible=True))
-fig_dd.update_yaxes(title="Drawdown", tickformat=".0%")
-st.plotly_chart(fig_dd, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
+fig_dd.add_trace(go.Scatter(x=dd_df["Date"], y=dd_df["Drawdown"], mode="lines", name="Drawdown"))
+fig_dd.update_layout(template="plotly_white", height=260, margin=dict(l=20, r=20, t=10, b=40))
+fig_dd.update_yaxes(tickformat=".0%")
+fig_dd.update_xaxes(rangeslider=dict(visible=True))
+st.plotly_chart(fig_dd, use_container_width=True)
 
-# Debug: per-ticker P/L
+# =========================================================
+# INDUSTRY / ASSET-TYPE ABUNDANCE (NO UNKNOWN)
+# =========================================================
+st.markdown("## Industry / Asset-Type Abundance")
+
+group_by = st.radio("Group by", ["Industry", "Sector", "Asset Type"], index=0, horizontal=True)
+grp = inputs.groupby(group_by)["Exposure"].sum().sort_values(ascending=False).reset_index()
+
+fig_ind = px.pie(
+    grp, names=group_by, values="Exposure", hole=0.4,
+    title=f"{group_by} Allocation (by Exposure)", template="plotly_white"
+)
+fig_ind.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+st.plotly_chart(fig_ind, use_container_width=True)
+st.dataframe(grp, use_container_width=True)
+
+# =========================================================
+# NEWS BY STOCK (Yahoo -> Google fallback)
+# =========================================================
+st.markdown("## Stock-Specific News")
+
+selected = st.multiselect(
+    "Select tickers for news",
+    inputs["Ticker"].tolist(),
+    default=inputs["Ticker"].tolist()[: min(5, len(inputs))],
+)
+max_items = st.slider("Max headlines per ticker", 3, 25, 10)
+
+for t in selected:
+    st.subheader(t)
+
+    df_news = yahoo_news(t, n=max_items)
+    if df_news.empty or df_news["title"].fillna("").str.strip().eq("").all():
+        st.caption("Source: Google News (RSS)")
+        df_news = google_news(t, n=max_items)
+    else:
+        st.caption("Source: Yahoo Finance (yfinance)")
+
+    render_news(df_news, max_items=max_items)
+
 if show_debug:
-    with st.expander("Show per-ticker P/L lines (debug)"):
-        per_df = pd.DataFrame(pl_tn, index=price_hist.index, columns=tickers_used)
-        st.dataframe(per_df, use_container_width=True)
+    st.markdown("### Debug")
+    st.write("Equity tail:")
+    st.dataframe(equity.tail(10), use_container_width=True)
