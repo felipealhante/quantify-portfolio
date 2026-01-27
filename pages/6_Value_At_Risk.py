@@ -75,8 +75,8 @@ def historical_var(dollar_returns: pd.Series, confidence: float) -> float:
 # -----------------------------
 st.set_page_config(page_title="Portfolio VaR (Historical)", layout="wide")
 
-st.title("Portfolio Value-at-Risk (Historical)")
-st.caption("Equal-weight portfolio • rolling log-return sums • converted to dollars • histogram + VaR line.")
+st.title("Portfolio Value-at-Risk")
+st.caption("Measure the risk of your portfolio.")
 
 
 # -----------------------------
@@ -91,9 +91,8 @@ with st.sidebar:
     confidence_interval = st.slider("Confidence interval", min_value=0.80, max_value=0.99, value=0.95, step=0.01)
 
     tickers_input = st.text_input(
-        "Tickers (comma-separated)"
-        help="Example: NVDA, KC=F, AAPL",
-    )
+        "Tickers (comma-separated)",
+        help="Example: NVDA, KC=F, AAPL",)
 
     run = st.button("Run", type="primary", use_container_width=True)
 
