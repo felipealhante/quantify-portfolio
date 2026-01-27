@@ -23,8 +23,7 @@ st.markdown(
 
 st.title("World Bank GDP Explorer")
 st.caption(
-    "Interactive: hover labels, zoom/drag, range slider, multi-country (max 6). "
-    "Growth bars are always shown underneath. GDP comparison is optional."
+    "Visualize the GDP of mulitple countries, with a maximum of six countries per graphing."
 )
 
 # =========================
@@ -86,11 +85,11 @@ code_map = countries.set_index("country")["code"].to_dict()
 with st.sidebar:
     st.header("Inputs")
 
-    default = [c for c in ["Brazil", "United States", "China"] if c in code_map]
+
     selected = st.multiselect(
         "Countries (max 6)",
         options=countries["country"].tolist(),
-        default=default,
+
     )
 
     if len(selected) == 0:
