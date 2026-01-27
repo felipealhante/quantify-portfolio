@@ -323,6 +323,21 @@ show_inputs = inputs.copy()
 # pretty percent
 show_inputs["P/L %"] = show_inputs["P/L %"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
 st.dataframe(show_inputs, use_container_width=True)
+# =========================
+# PORTFOLIO TOTALS (show above allocation pie)
+# =========================
+total_exposure = float(inputs["Exposure"].sum())          # "initial money" baseline
+total_pl = float(inputs["P/L"].sum())
+initial_money = total_exposure
+current_money = total_exposure + total_pl
+total_return_pct = (total_pl / total_exposure) if total_exposure > 0 else np.nan
+
+st.markdown("## Portfolio Totals")
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Initial Money (Gross Exposure)", f"{initial_money:,.2f}")
+c2.metric("Current Money (Exposure + P/L)", f"{current_money:,.2f}")
+c3.metric("Total % Gained", f"{total_return_pct:.2%}" if pd.notna(total_return_pct) else "—")
 
 # Allocation pie
 if show_pie:
