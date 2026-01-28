@@ -323,36 +323,74 @@ show_inputs = inputs.copy()
 # pretty percent
 show_inputs["P/L %"] = show_inputs["P/L %"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
 st.dataframe(show_inputs, use_container_width=True)
-# =========================
-# PORTFOLIO TOTALS (show above allocation pie)
-# =========================
-total_exposure = float(inputs["Exposure"].sum())          # "initial money" baseline
-total_pl = float(inputs["P/L"].sum())
-initial_money = total_exposure
-current_money = total_exposure + total_pl
-total_return_pct = (total_pl / total_exposure) if total_exposure > 0 else np.nan
+# =========================================================
+# PIE CHARTS (SIDE-BY-SIDE)
+# =========================================================
 
-st.markdown("## Portfolio Totals")
+# Centered section title
+st.markdown(
+    "<h2 style='text-align: center;'>Allocation &amp; Abundance</h2>",
+    unsafe_allow_html=True
+)
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Initial Money (Gross Exposure)", f"{initial_money:,.2f}")
-c2.metric("Current Money (Exposure + P/L)", f"{current_money:,.2f}")
-c3.metric("Total % Gained", f"{total_return_pct:.2%}" if pd.notna(total_return_pct) else "—")
+left, right = st.columns(2)
 
-# Allocation pie
-if show_pie:
-    st.markdown("## Allocation (by Exposure)")
+# -------- Left: Allocation pie (by Exposure) --------
+with left:
+    st.markdown("### Allocation (by Exposure)")
     pie_df = inputs[["Ticker", "Exposure"]].copy()
     pie_df = pie_df[pie_df["Exposure"] > 0]
+
     if pie_df.empty:
         st.info("No exposure to plot.")
     else:
         fig_alloc = px.pie(
-            pie_df, names="Ticker", values="Exposure", hole=0.45,
-            title="Exposure Allocation", template="plotly_white",
+            pie_df,
+            names="Ticker",
+            values="Exposure",
+            hole=0.45,
+            template="plotly_white",
         )
-        fig_alloc.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+        fig_alloc.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
         st.plotly_chart(fig_alloc, use_container_width=True)
+
+# -------- Right: Abundance pie (no title) --------
+with right:
+    group_by = st.radio(
+        "Group by",
+        ["Industry", "Sector", "Asset Type"],
+        index=0,
+        horizontal=True,
+        key="group_by_abundance",
+    )
+
+    grp = (
+        inputs.groupby(group_by)["Exposure"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+
+    if grp.empty:
+        st.info("No data to plot.")
+    else:
+        fig_ind = px.pie(
+            grp,
+            names=group_by,
+            values="Exposure",
+            hole=0.4,
+            template="plotly_white",
+        )
+        fig_ind.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
+        st.plotly_chart(fig_ind, use_container_width=True)
+
+st.dataframe(grp, use_container_width=True)
 
 # =========================================================
 # HISTORICAL PRICES
@@ -384,7 +422,11 @@ for _, r in inputs.iterrows():
     else:
         pl = (entry - prices[t]) * shares * mult
 
-    equity[t] = 100.0 * (1.0 + (pl / exposure))
+    equity[t] = np.where(
+        exposure > 0,
+        100.0 * (1.0 + (pl / exposure)),
+        100.0
+    )
 
 perf_long = equity.reset_index().rename(columns={"index": "Date"}).melt(
     id_vars="Date",
@@ -442,21 +484,6 @@ fig_dd.update_yaxes(tickformat=".0%")
 fig_dd.update_xaxes(rangeslider=dict(visible=True))
 st.plotly_chart(fig_dd, use_container_width=True)
 
-# =========================================================
-# INDUSTRY / ASSET-TYPE ABUNDANCE (NO UNKNOWN)
-# =========================================================
-st.markdown("## Industry / Asset-Type Abundance")
-
-group_by = st.radio("Group by", ["Industry", "Sector", "Asset Type"], index=0, horizontal=True)
-grp = inputs.groupby(group_by)["Exposure"].sum().sort_values(ascending=False).reset_index()
-
-fig_ind = px.pie(
-    grp, names=group_by, values="Exposure", hole=0.4,
-    title=f"{group_by} Allocation (by Exposure)", template="plotly_white"
-)
-fig_ind.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
-st.plotly_chart(fig_ind, use_container_width=True)
-st.dataframe(grp, use_container_width=True)
 
 # =========================================================
 # NEWS BY STOCK (Yahoo -> Google fallback)
