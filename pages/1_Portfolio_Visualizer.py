@@ -324,6 +324,33 @@ show_inputs = inputs.copy()
 show_inputs["P/L %"] = show_inputs["P/L %"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
 st.dataframe(show_inputs, use_container_width=True)
 # =========================================================
+# PORTFOLIO TOTALS
+# =========================================================
+initial_money = float(inputs["Exposure"].sum())
+total_pl = float(inputs["P/L"].sum())
+current_money = initial_money + total_pl
+pct_gained = (total_pl / initial_money) if initial_money > 0 else np.nan
+
+st.markdown("## Portfolio Summary")
+
+c1, c2, c3 = st.columns(3)
+
+c1.metric(
+    "Initial Money",
+    f"${initial_money:,.2f}"
+)
+
+c2.metric(
+    "Current Money",
+    f"${current_money:,.2f}",
+    delta=f"{total_pl:,.2f}"
+)
+
+c3.metric(
+    "Percentage Gained",
+    f"{pct_gained:.2%}" if pd.notna(pct_gained) else "—"
+)
+# =========================================================
 # PIE CHARTS (SIDE-BY-SIDE)
 # =========================================================
 
