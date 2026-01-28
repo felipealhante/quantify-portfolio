@@ -350,6 +350,7 @@ c3.metric(
     "Percentage Gained",
     f"{pct_gained:.2%}" if pd.notna(pct_gained) else "—"
 )
+
 # =========================================================
 # PIE CHARTS (SIDE-BY-SIDE)
 # =========================================================
